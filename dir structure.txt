@@ -1,0 +1,63 @@
+This is just Initial Plan we might change the structure as we continue-----
+
+HSI-Medical-Segmentation/
+├── .gitignore                    # Already done ✓
+├── README.md                     # Project description
+├── requirements.txt              # Dependencies
+├── setup.py                      # Package installation
+├── config/
+│   ├── __init__.py
+│   ├── config.yaml              # Main hyperparameters
+│   └── medical_datasets.yaml    # Dataset configurations
+├── data/                        # Already in .gitignore ✓
+│   ├── raw/                     # Original HSI datasets
+│   ├── processed/               # Preprocessed data
+│   └── splits/                  # Train/val/test splits
+├── src/
+│   ├── __init__.py
+│   ├── models/                  # Your architecture modules
+│   │   ├── __init__.py
+│   │   ├── spatial_branch.py    # 3D-2D CNN + 2D Mamba
+│   │   ├── spectral_branch.py   # 3D-MamBa processing
+│   │   ├── frequency_fusion.py  # HF-Net implementation
+│   │   ├── mt_sc_former.py      # Your novel replacement
+│   │   ├── scatter_back.py      # Position-aware reconstruction
+│   │   ├── pixel_decoder.py     # 3-stage decoder
+│   │   ├── segmentation_head.py # Final prediction
+│   │   └── full_model.py        # Complete pipeline
+│   ├── data/
+│   │   ├── __init__.py
+│   │   ├── datasets.py          # HSI dataset classes
+│   │   ├── transforms.py        # Data augmentation
+│   │   └── loaders.py           # DataLoader implementations
+│   ├── training/
+│   │   ├── __init__.py
+│   │   ├── trainer.py           # Training loop
+│   │   ├── losses.py            # Loss functions
+│   │   └── metrics.py           # Evaluation metrics
+│   └── utils/
+│       ├── __init__.py
+│       ├── visualization.py     # Plotting functions
+│       ├── medical_utils.py     # Medical-specific utilities
+│       └── logging.py           # Custom logging
+├── experiments/
+│   ├── train.py                 # Main training script
+│   ├── evaluate.py              # Evaluation script
+│   ├── inference.py             # Inference pipeline
+│   └── notebooks/               # Jupyter experiments
+│       ├── data_exploration.ipynb
+│       ├── model_analysis.ipynb
+│       └── results_visualization.ipynb
+├── tests/
+│   ├── __init__.py
+│   ├── test_models.py           # Model unit tests
+│   ├── test_data.py             # Data loading tests
+│   └── test_training.py         # Training tests
+├── saved/
+│   ├── models/                  # Trained model checkpoints
+│   ├── logs/                    # Training logs
+│   └── results/                 # Experiment results
+└── docs/
+    ├── architecture.md          # Model architecture docs
+    ├── usage.md                 # How to use guide
+    └── api_reference.md         # Code documentation
