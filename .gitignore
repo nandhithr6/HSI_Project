@@ -1,1 +1,9 @@
 /DATA
+
+#Visualisation of Pre-processed data
+!DATA/Placenta/visualisation_processed/
+!/DATA/Placenta/visualisation_processed/**
+
+# Data for training and testing
+src/data/Placenta/
+src/data/Placenta/**
