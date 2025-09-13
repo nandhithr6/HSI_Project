@@ -1,8 +1,13 @@
-/DATA
+# Ignore everything inside DATA
+/DATA/*
 
-#Visualisation of Pre-processed data
-!DATA/Placenta/visualisation_processed/
-!/DATA/Placenta/visualisation_processed/**
+# Allow Placenta folder itself and ignore all its contents
+!DATA/Placenta/
+DATA/Placenta/*
+
+# Only unignore this subfolder
+!DATA/Placenta/preprocessed_visualisations/
+!DATA/Placenta/preprocessed_visualisations/**
 
 # Data for training and testing
 src/data/Placenta/

@@ -4,125 +4,79 @@
 
 The Hyperspectral Placenta Dataset (Puustinen et al., 2023) comprises:
 
-- **101 hyperspectral images** acquired from four fresh human placentas  
-- **Spectral range**: 515–900 nm (visible to near-infrared)  
-- **Spatial resolution**: 1 024 × 1 024 pixels per band  
-- **Annotations**: Pixel-wise segmentation masks delineating arteries, veins, stroma and umbilical cord  
+- **101 hyperspectral image cubes** from four fresh human placentas  
+- **Spectral range (after preprocessing)**: 37–38 bands, spanning ~515–700 nm  
+- **Spatial resolution**: 1024 × 1024 pixels per band  
+- **Annotations**: Pixel-wise segmentation masks for arteries, veins, stroma, umbilical cord, specular reflection, and (for some subsets) suture, red/blue dyes, and ICG-marked tissue  
 
 Imaging conditions by group:
 1. **Patient 1** (6 images): No dye (baseline tissue)  
 2. **Patient 2** (24 images): Red/blue food dye (enhanced vessel contrast)  
 3. **Patient 3** (23 images): Red/blue food dye (enhanced vessel contrast)  
-4. **Patient 4** (48 images): ICG fluorescent dye (near-infrared fluorescence)
+4. **Patient 4** (48 images): ICG fluorescent dye (near-infrared fluorescence, truncated to visible bands in preprocessed cubes)
 
 ---
 
-## Rationale for Preprocessing
+## Preprocessing Notes
 
-Hyperspectral raw data contain several systematic distortions:
+### Raw vs. Preprocessed Data
+- The original release includes **raw `.dat` + `.hdr` files** along with white/dark references.  
+- The authors also provide **preprocessed `.tif` cubes**:  
+  - Already flat-field & dark corrected  
+  - Calibrated with white-reference reflectance  
+  - Cropped to the relevant 37–38 visible bands (~515–700 nm)  
+  - Intensity scaled to reflectance [0, 1]  
+- Masks are distributed as aligned `.tif` files.  
 
-1. **Sensor Noise & Dark Current**  
-   - Electronic readout noise and thermal charge accumulate in each pixel even with no illumination.  
-2. **Illumination Non-Uniformity**  
-   - Vignetting, spatial variation in light source intensity and optical path irregularities create shading artifacts.  
-3. **Spectral Response Variability**  
-   - Detector sensitivity and optical components differ across wavelengths; raw values lack physical units.  
-4. **Dye-Induced Spectral Shifts**  
-   - Contrast agents (food dyes, ICG) introduce absorption/emission peaks that must be isolated from instrument artifacts.
+👉 In this project, we use the **authors’ preprocessed `.tif` cubes and masks** directly.  
+This avoids redundant calibration and guarantees reproducibility with published work.  
 
-Without correction, machine learning models will learn instrument-specific patterns rather than true tissue reflectance, leading to poor generalization and unreliable biological interpretation.
-
----
-
-## Preprocessing Pipeline (Following Original Authors)
-
-The published methodology specifies the following steps. Each step is applied exactly as defined in the dataset’s reference materials:
-
-1. **Flat-Field and Dark-Current Correction**  
-   - **Formula**
-      Corrected image = (Raw image − Dark reference) / (White reference − Dark reference),
-  
-      where 
-      Raw image → what the sensor actually captured
-      Dark reference (D) → sensor’s own noise (measured with no light)
-      White reference (W) → image of a uniform bright surface
- 
-   - **Purpose**  
-     - Removes pixel-level electronic noise  
-     - Compensates for spatial illumination non-uniformity  
-     - Yields relative reflectance free of shading artifacts  
-
-2. **Absolute Reflectance Calibration**  
-   - **Data Source**  
-     - `white reference reflectance.txt`: Spectrophotometer-measured reflectance values for the white standard at each wavelength.  
-   - **Procedure**  
-     1. Interpolate the measured reflectance curve to the camera’s spectral band centers.  
-     2. Multiply each band of the flat-field–corrected cube by its corresponding interpolated reflectance value.  
-   - **Outcome**  
-     - Converts relative units to true reflectance (0–1), enabling quantitative comparison across datasets and literature.  
-
-3. **Band Selection, Clipping & Normalization**  
-   - **Band Range**  
-     - Retain only 515–700 nm as per experimental focus and dataset definitions.  
-   - **Clipping**  
-     - Apply [0,1] clamp to eliminate outliers and enforce physical reflectance bounds.  
-   - **Normalization**  
-     - Scale pixel values linearly to [0,1] if any custom clamp range is specified in `definitions.json`.  
-   - **Reason**  
-     - Standardizes input range for neural networks and removes residual extreme values.  
-
-4. **Segmentation Mask Handling**  
-   - **Provided Masks**  
-     - Pre-rasterized TIFF masks aligned with hyperspectral cubes.  
-   - **Usage**  
-     - Employed directly as ground truth for pixel-wise classification.  
-   - **Justification**  
-     - Avoids any interpolation or misalignment; retains expert annotations exactly.
+### Why Understanding the Raw Pipeline Still Matters
+Even though we rely on `.tif` cubes, we studied the raw preprocessing procedure because:  
+1. It clarifies **how reflectance values were derived**.  
+2. It helps when extending methods to **new datasets** (where only raw data may be available).  
+3. It ensures transparency when explaining **what preprocessing steps were applied**.  
 
 ---
 
 ## Data Splitting Strategies
 
-Effective model evaluation requires balancing spectral diversity, patient variability, and preventing data leakage. The following approaches were evaluated:
+Effective evaluation requires balancing dye conditions and patient variability. Three strategies were considered:
 
-### 1. Patient-Level or Dye-Level Split
+### 1. Patient- or Dye-Level Splits  
+- Assign whole patient groups or dye conditions to train/val/test.  
+- ❌ Leads to imbalance (6 vs. 48 images), domain shift, and unrealistic scenarios.  
 
-- **Description**  
-  - Assign entire patient groups or dye conditions exclusively to train, validation or test.  
-- **Limitations**  
-  - **Imbalanced samples**: Patient 1’s 6 images vs. Patient 4’s 48 images.  
-  - **Domain shift**: Test set may contain dyes (e.g., ICG) unseen during training.  
-  - **Unrealistic evaluation**: In practice, models must handle mixtures of protocols.  
+### 2. Random Image-Level Split  
+- Random 70/15/15% assignment without stratification.  
+- ❌ Risks data leakage and uncontrolled dye distribution.  
 
-### 2. Random Image-Level Split
-
-- **Description**  
-  - Random 70/15/15% assignment of images, ignoring patient or dye labels.  
-- **Limitations**  
-  - **Data leakage risk**: Adjacently acquired or spatially similar regions may appear in both train and test.  
-  - **Uncontrolled dye distribution**: No guarantee of balanced dye representation.  
-
-### 3. Stratified Split Across All Conditions  **← Selected**
-
-- **Principle**  
-  - Each split (train/validation/test) must contain proportional representation from all four patient groups and all three dye conditions.  
-- **Implementation**  
-  - **Training**: 70% (~71 images)  
-  - **Validation**: 15% (~15 images)  
-  - **Test**: 15% (~15 images)  
-  - **Stratification targets**: ~6% no dye, ~46% red/blue dye, ~48% ICG in each split.  
-- **Advantages**  
-  1. **Spectral Robustness**: Model learns features from every dye-induced spectral variation.  
-  2. **Clinical Relevance**: Reflects real-world variability in dye protocols.  
-  3. **Data Integrity**: Prevents leakage by stratifying at patient and dye level simultaneously.  
-  4. **Balanced Evaluation**: Ensures fair performance assessment across all conditions.
+### 3. **Stratified Split Across All Conditions (Chosen)**  
+- Each split contains proportional representation from all patient groups and dye conditions.  
+- **Training**: ~70% (≈71 images)  
+- **Validation**: ~15% (≈15 images)  
+- **Test**: ~15% (≈15 images)  
+- Stratification ensures:  
+  - Spectral robustness  
+  - Balanced dye effects  
+  - No leakage  
+  - Clinically realistic evaluation  
 
 ---
 
 ### Why Dye Stratification Matters
 
-- **Food Dyes**: Produce absorption changes in visible bands (450–700 nm).  
-- **ICG Fluorescence**: Alters near-infrared reflectance around 780–900 nm.  
-- **No Dye**: Baseline tissue spectra devoid of contrast agent effects.  
+- **Food Dyes**: Alter visible absorption (450–700 nm).  
+- **ICG**: Alters reflectance in near-infrared (~780–900 nm), though truncated in `.tif` cubes.  
+- **No Dye**: Baseline tissue for comparison.  
 
-A split that omits any dye in training will leave the model blind to those spectral effects, causing catastrophic failure when encountering them in validation or test. The stratified approach ensures that training, validation and test datasets each contain examples of every spectral condition, fostering generalization and reliable performance in downstream tissue classification tasks. 
+👉 Including all dye conditions in every split is essential for generalization. Otherwise, models would catastrophically fail when tested on unseen dye protocols.  
+
+---
+
+## Summary
+
+- We **use the authors’ preprocessed `.tif` cubes** and corresponding masks.  
+- We understand and can reimplement the **raw preprocessing pipeline** if required for other datasets.  
+- For model training and evaluation, we employ a **stratified split** across all conditions (no dye, food dye, ICG).  
+- This ensures **balanced, robust, and clinically meaningful evaluation**.
