@@ -185,9 +185,9 @@ class TokenScorer(nn.Module):
 # -------------------------------------------------
 class TokenCompressor(nn.Module):
     """
-    Two-stage compression strategy simplified into Top-K selection:
-    - Stage 1 (pair-constrained selection) can be added later
-    - Stage 2 (Top-K within subsets) implemented directly here
+    Token compression in 2 stages:
+    - Stage 1: Pair-constrained selection (mutual attention-based)
+    - Stage 2: Top-K selection per modality
     """
     def __init__(self, N_pairs=5000, K_spatial=800, K_spectral=2000):
         super().__init__()
@@ -196,15 +196,50 @@ class TokenCompressor(nn.Module):
         self.K_spectral = K_spectral
 
     def forward(self, Score_spatial, Score_spectral, Tspatial, Tspectral):
-        # --- Top-K spatial tokens
-        topk_sp = torch.topk(Score_spatial, k=min(self.K_spatial, Score_spatial.size(1)), dim=1)
-        idx_sp = topk_sp.indices
-        T_spatial_sel = torch.gather(Tspatial, 1, idx_sp.unsqueeze(-1).expand(-1, -1, Tspatial.size(-1)))
+        B, N1, D = Tspatial.shape
+        _, N2, _ = Tspectral.shape
 
-        # --- Top-K spectral tokens
-        topk_spec = torch.topk(Score_spectral, k=min(self.K_spectral, Score_spectral.size(1)), dim=1)
+        # -------------------------------
+        # Stage 1: Pair-Constrained Selection
+        # -------------------------------
+        # compute affinity matrix (cosine similarity)
+        norm_sp = F.normalize(Tspatial, dim=-1)  # (B, N1, D)
+        norm_spec = F.normalize(Tspectral, dim=-1)  # (B, N2, D)
+
+        # (B, N1, N2) similarity scores
+        affinity = torch.bmm(norm_sp, norm_spec.transpose(1, 2))
+
+        # flatten to (B, N1*N2)
+        affinity_flat = affinity.view(B, -1)
+
+        # select top-N_pairs globally
+        top_pairs = torch.topk(affinity_flat, k=min(self.N_pairs, affinity_flat.size(1)), dim=1)
+        pair_indices = top_pairs.indices  # (B, N_pairs)
+
+        # convert flat indices → (i_spatial, j_spectral)
+        i_spatial = pair_indices // N2
+        j_spectral = pair_indices % N2
+
+        # gather paired tokens
+        Tspatial_pairs = torch.gather(Tspatial, 1, i_spatial.unsqueeze(-1).expand(-1, -1, D))
+        Tspectral_pairs = torch.gather(Tspectral, 1, j_spectral.unsqueeze(-1).expand(-1, -1, D))
+
+        # -------------------------------
+        # Stage 2: Top-K per modality
+        # -------------------------------
+        # recompute scores restricted to selected pairs
+        Score_spatial_sel = torch.gather(Score_spatial, 1, i_spatial)
+        Score_spectral_sel = torch.gather(Score_spectral, 1, j_spectral)
+
+        # spatial Top-K
+        topk_sp = torch.topk(Score_spatial_sel, k=min(self.K_spatial, Score_spatial_sel.size(1)), dim=1)
+        idx_sp = topk_sp.indices
+        T_spatial_sel = torch.gather(Tspatial_pairs, 1, idx_sp.unsqueeze(-1).expand(-1, -1, D))
+
+        # spectral Top-K
+        topk_spec = torch.topk(Score_spectral_sel, k=min(self.K_spectral, Score_spectral_sel.size(1)), dim=1)
         idx_spec = topk_spec.indices
-        T_spectral_sel = torch.gather(Tspectral, 1, idx_spec.unsqueeze(-1).expand(-1, -1, Tspectral.size(-1)))
+        T_spectral_sel = torch.gather(Tspectral_pairs, 1, idx_spec.unsqueeze(-1).expand(-1, -1, D))
 
         return T_spatial_sel, T_spectral_sel
 
