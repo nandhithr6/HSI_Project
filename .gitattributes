@@ -1,0 +1,4 @@
+saved/models/** filter=lfs diff=lfs merge=lfs -text
+saved/**/best.pt filter=lfs diff=lfs merge=lfs -text
+saved/**/last.pt filter=lfs diff=lfs merge=lfs -text
+*.pt filter=lfs diff=lfs merge=lfs -text
