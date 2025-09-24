@@ -53,6 +53,38 @@ def print_memory_usage(device):
         self.seg_head = HierarchicalSegmentationHead(
             feature_dim=input_token_dim // 8, num_classes=num_classes
         )
+        
+    def forward(self, fused_tokens: torch.Tensor, 
+                freq_features: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Args:
+            fused_tokens: [B, N, D] where N=2800, D=256
+            freq_features: [B, 256, 128] from HF-Net (optional)
+        Returns:
+            features: [B, 32, 32, 512]
+        """
+        # This forward method is incorrect and belongs to TokenToFeatureConverter
+        # It will be replaced by the correct forward pass of the decoder
+        pass
+
+class TokenToFeatureConverter(nn.Module):
+    """
+    Converts a sequence of tokens into a 2D feature map, adding positional
+    encoding and optionally integrating cross-modal features.
+    """
+    def __init__(self, input_dim: int, output_dim: int, spatial_size: int):
+        super().__init__()
+        self.spatial_size = spatial_size
+        self.output_dim = output_dim
+        
+        # Linear projection for input tokens
+        self.token_linear = nn.Linear(input_dim, output_dim)
+        
+        # 2D positional encoding
+        self.pos_encoding = self._generate_2d_pos_encoding(spatial_size, output_dim)
+        
+        # Cross-attention for integrating frequency features
+        self.cross_attention = nn.MultiheadAttention(output_dim, num_heads=8, batch_first=True)
         self.layer_norm = nn.LayerNorm(output_dim)
         
     def _generate_2d_pos_encoding(self, size: int, dim: int) -> torch.Tensor:
@@ -68,7 +100,7 @@ def print_memory_usage(device):
                     pos_enc[i, j, 4*k+2] = math.sin(j / div_term)
                     pos_enc[i, j, 4*k+3] = math.cos(j / div_term)
                     
-        return pos_enc.flatten(0, 1)  # [size*size, dim]
+        return nn.Parameter(pos_enc.flatten(0, 1).unsqueeze(0), requires_grad=False)  # [1, size*size, dim]
     
     def forward(self, fused_tokens: torch.Tensor, 
                 freq_features: Optional[torch.Tensor] = None) -> torch.Tensor:
@@ -84,32 +116,32 @@ def print_memory_usage(device):
         # Adaptive Token Embedding
         F0 = self.token_linear(fused_tokens)  # [B, N, 512]
         
-        # Take first 1024 tokens and reshape to 32x32 grid
-        F0_reshaped = F0[:, :1024, :].contiguous()  # [B, 1024, 512]
-        F0_spatial = F0_reshaped.view(B, 32, 32, -1)  # [B, 32, 32, 512]
+        # Take first spatial_size*spatial_size tokens and reshape
+        num_tokens_to_take = self.spatial_size * self.spatial_size
+        F0_reshaped = F0[:, :num_tokens_to_take, :].contiguous()  # [B, 1024, 512]
         
         # Add positional encoding
-        F_pos = F0_spatial + self.pos_encoding.view(32, 32, -1).unsqueeze(0)
+        F_pos = F0_reshaped + self.pos_encoding
         
         # Cross-modal integration if freq_features provided
         if freq_features is not None:
             # Reshape for attention
-            F_flat = F_pos.flatten(1, 2)  # [B, 1024, 512]
             freq_proj = F.adaptive_avg_pool1d(
-                freq_features.transpose(1, 2), 1024
+                freq_features.transpose(1, 2), num_tokens_to_take
             ).transpose(1, 2)  # [B, 1024, 128]
             
             # Pad freq features to match dimension
-            freq_padded = F.pad(freq_proj, (0, 512-128))  # [B, 1024, 512]
+            freq_padded = F.pad(freq_proj, (0, self.output_dim - freq_proj.shape[-1]))  # [B, 1024, 512]
             
             # Cross attention
-            F_integrated, _ = self.cross_attention(F_flat, freq_padded, freq_padded)
-            F_integrated = self.layer_norm(F_integrated + F_flat)
-            
-            # Reshape back
-            F_pos = F_integrated.view(B, 32, 32, -1)
+            F_integrated, _ = self.cross_attention(F_pos, freq_padded, freq_padded)
+            F_integrated = self.layer_norm(F_integrated + F_pos)
+            F_pos = F_integrated
+
+        # Reshape to spatial dimensions
+        F_spatial = F_pos.view(B, self.spatial_size, self.spatial_size, -1)
         
-        return F_pos.contiguous()
+        return F_spatial.contiguous()
 
 class TransformerBlock(nn.Module):
     """Transformer block with spatial awareness"""
@@ -327,19 +359,22 @@ class MSTDHSHDecoder(nn.Module):
     def __init__(self, 
                  input_token_dim: int = 256,
                  num_classes: int = 5,
-                 scales: list = [64, 128, 256, 512]):
+                 scales: list = [64, 128, 256, 512],
+                 verbose: bool = False):
         super().__init__()
         
         self.scales = scales
         self.num_classes = num_classes
         
-        print("🚀 Initializing MSTD+HSH Decoder...")
+        if verbose:
+            print("🚀 Initializing MSTD+HSH Decoder...")
         
         # Stage 1: Token-to-Feature Conversion
         self.token_converter = TokenToFeatureConverter(
             input_dim=input_token_dim, output_dim=512, spatial_size=32
         )
-        print("   ✓ Token-to-Feature Converter")
+        if verbose:
+            print("   ✓ Token-to-Feature Converter")
         
         # Stage 2: Hierarchical Upsampling with Cross-Scale Attention
         # Scale 1: 32x32 -> 64x64 (512 -> 256 channels)
@@ -370,9 +405,11 @@ class MSTDHSHDecoder(nn.Module):
         self.seg_head = HierarchicalSegmentationHead(
             feature_dim=32, num_classes=num_classes
         )
-        print("   ✓ Hierarchical Segmentation Head")
+        if verbose:
+            print("   ✓ Hierarchical Segmentation Head")
         
-        print("🎯 MSTD+HSH Decoder initialization complete!")
+        if verbose:
+            print("🎯 MSTD+HSH Decoder initialization complete!")
     
     def forward(self, fused_tokens: torch.Tensor, 
                 freq_features: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:

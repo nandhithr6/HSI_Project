@@ -19,6 +19,7 @@ These are ready to be passed into the Token Cross-Modal Enhancer (TCME).
 import torch
 import torch.nn as nn
 import math
+from typing import Dict
 from src.models.spatial_stream import (
     LocalFeatureStream,
     GlobalFeatureStream,
@@ -49,9 +50,8 @@ class HSIModel(nn.Module):
         # --- Spatial Branch ---
         self.local_stream = LocalFeatureStream(num_bands)
         self.global_stream = GlobalFeatureStream(num_bands, embed_dim=spatial_embed_dim, patch_size=global_patch_size)
-        self.fusion = SpatialFusionModule(channels=128)  # local final channels fixed at 128
-        # Align global stream channels (spatial_embed_dim) to local channels (128) for fusion
-        self.global_reduce = nn.Conv2d(spatial_embed_dim, 128, kernel_size=1, bias=False)
+        self.spatial_fusion = SpatialFusionModule(channels=128)
+        self.spatial_fusion_align = nn.Conv2d(spatial_embed_dim, 128, kernel_size=1, bias=False)
         self.spatial_tokenizer = SpatialTokenizer(
             in_channels=128,
             embed_dim=spatial_embed_dim,
@@ -81,7 +81,7 @@ class HSIModel(nn.Module):
         self.hcmff = HierarchicalCrossModalityFrequencyFusion(feature_dim=spatial_embed_dim, verbose=verbose)
 
         # --- Decoder ---
-        self.decoder = MSTDHSHDecoder(input_token_dim=spatial_embed_dim, num_classes=num_classes)
+        self.decoder = MSTDHSHDecoder(input_token_dim=spatial_embed_dim, num_classes=num_classes, verbose=verbose)
 
         if self.verbose:
             print("[Init] Spatial branch initialized: Local + Global will run in parallel.")
@@ -101,75 +101,73 @@ class HSIModel(nn.Module):
         return (dev.type == 'cpu') or (getattr(dev, 'index', None) in (None, 0))
 
 
-    def forward(self, x):
-        # x: (B, Bands, H, W)
-        B, Bands, H, W = x.shape
+    def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """
+        Forward pass of the complete HSI model.
 
-        # --- Spatial: Local and Global run in parallel ---
-        if self._should_log(x):
-            print("[Flow] Starting parallel spatial (local+global) and spectral processing...")
-            print(f"[FWD] Input: {tuple(x.shape)}")
-        f_local = self.local_stream(x)  # (B, 128, H, W)
-        f_global = self.global_stream(x)  # (B, spatial_embed_dim, H/patch, W/patch)
-        if self._should_log(x):
-            print("[Flow] Spatial branch parallel paths done: local and global features computed.")
-            print(f"[FWD] Local -> {tuple(f_local.shape)} | Global -> {tuple(f_global.shape)}")
-        f_global = self.global_reduce(f_global)  # (B, 128, H/4, W/4)
-        if self._should_log(x):
-            print("[Flow] Global branch aligned to local channels; proceeding to spatial fusion.")
-            print(f"[FWD] Global reduced -> {tuple(f_global.shape)}")
+        Args:
+            x (torch.Tensor): Input HSI data cube of shape (B, Bands, H, W).
 
-        # --- Upsample global to match local, fuse ---
-        f_fused = self.fusion(f_local, f_global)  # (B, 128, H, W)
-        if self._should_log(x):
-            print("[Flow] Spatial fusion executed; fused spatial features ready.")
-            print(f"[FWD] Fused spatial -> {tuple(f_fused.shape)}")
+        Returns:
+            Dict[str, torch.Tensor]: Dictionary of output tensors, including logits.
+        """
+        # Ensure contiguous memory before entering each major module to prevent misaligned address errors
+        # under DataParallel and AMP.
+        x_contig = x.contiguous()
 
-        # --- Tokenize fused spatial features ---
-        if self._should_log(x):
-            print("[Flow] Preparing tokenization: spatial (patch-level) and spectral (pixel-level).")
-        spatial_tokens = self.spatial_tokenizer(f_fused)  # (B, N_patches, spatial_embed_dim)
-        if self._should_log(x):
-            print(f"[FWD] Spatial patch tokens -> {tuple(spatial_tokens.shape)}")
+        # 1. Parallel Spatial and Spectral Processing
+        if self.verbose: print("[Flow] Starting parallel spatial (local+global) and spectral processing...")
+        if self.verbose: print(f"[FWD] Input: {tuple(x_contig.shape)}")
 
-        # --- Spectral stream (runs in parallel to spatial) ---
-        spectral_map = self.spectral_stream(x)  # (B, spectral_embed_dim, H, W)
-        spectral_tokens = spectral_map.permute(0, 2, 3, 1).contiguous().view(B, H * W, -1)
+        # --- Spatial Branches ---
+        with torch.cuda.amp.autocast(enabled=False):
+            f_local = self.local_stream(x_contig.float())
+        f_global = self.global_stream(x_contig)
+        if self.verbose: print(f"[FWD] Local -> {tuple(f_local.shape)} | Global -> {tuple(f_global.shape)}")
+
+        # --- Spectral Branch ---
+        # The spectral stream now returns a map, not tokens. We flatten it for TCME.
+        spectral_map = self.spectral_stream(x_contig)
+        B, D, H, W = spectral_map.shape
+        T_spectral = spectral_map.permute(0, 2, 3, 1).contiguous().view(B, H * W, D)
+        if self.verbose: print(f"[Tokens] Spectral: N={T_spectral.shape[1]} D={T_spectral.shape[2]} | map={tuple(spectral_map.shape)}")
+
+        # 2. Spatial Fusion and Tokenization
+        if self.verbose: print("[Flow] Global branch aligned to local channels; proceeding to spatial fusion.")
+        f_global_aligned = self.spatial_fusion_align(f_global.contiguous())
+        if self.verbose: print(f"[FWD] Global reduced -> {tuple(f_global_aligned.shape)}")
+
+        f_fused = self.spatial_fusion(f_local.contiguous(), f_global_aligned)
+        if self.verbose: print("[Flow] Spatial fusion executed; fused spatial features ready.")
+        if self.verbose: print(f"[FWD] Fused spatial -> {tuple(f_fused.shape)}")
+
+        if self.verbose: print("[Flow] Preparing tokenization: spatial (patch-level) and spectral (pixel-level).")
+        # Force float32 for the tokenizer to prevent CUBLAS errors with mixed precision.
+        with torch.cuda.amp.autocast(enabled=False):
+            T_spatial = self.spatial_tokenizer(f_fused.contiguous().float())
+        if self.verbose: print(f"[Tokens] Spatial: N={T_spatial.shape[1]} D={T_spatial.shape[2]} | grid={self.spatial_tokenizer.grid_size} | patch={self.spatial_tokenizer.patch_size}")
+
+        # Align spectral token dimension to spatial before TCME
         if self._needs_spec_proj:
-            spectral_tokens = self.spectral_to_spatial(spectral_tokens)
-        if self._should_log(x):
-            print("[Flow] Spectral pixel-level tokenization complete in parallel with spatial.")
-            print(f"[FWD] Spectral map -> {tuple(spectral_map.shape)} | Spectral tokens -> {tuple(spectral_tokens.shape)}")
+            T_spectral = self.spectral_to_spatial(T_spectral.contiguous())
+            if self.verbose: print(f"[Flow] Spectral tokens projected to match spatial dim -> {tuple(T_spectral.shape)}")
 
-        # --- TCME ---
-        if self._should_log(x):
-            try:
-                K_sp = self.tcme.compressor.K_spatial
-                K_spec = self.tcme.compressor.K_spectral
-            except Exception:
-                K_sp, K_spec = None, None
-            if K_sp is not None and K_spec is not None and K_sp > 0 and K_spec > 0:
-                g = math.gcd(int(K_sp), int(K_spec))
-                simple = (K_sp//g, K_spec//g) if g > 0 else (K_sp, K_spec)
-                ratio = (K_sp / float(K_spec))
-                print("[Flow] TCME: joint pairing in progress; compressing tokens to balance spatial and spectral.")
-                print(f"[Flow] Sweet point ratio K_spatial:K_spectral = {K_sp}:{K_spec} (~{ratio:.2f}:1), simplified {simple[0]}:{simple[1]}")
-            else:
-                print("[Flow] TCME: joint pairing + token compression to balance modalities.")
-        T_spatial_sel, T_spectral_sel = self.tcme(spatial_tokens, spectral_tokens, H, W)
-        if self._should_log(x):
-            print(f"[FWD] TCME output -> spatial {tuple(T_spatial_sel.shape)}, spectral {tuple(T_spectral_sel.shape)}")
+        # 3. Cross-Modal Token Enhancement (TCME)
+        if self.verbose: print("[Flow] TCME: joint pairing in progress; compressing tokens to balance spatial and spectral.")
+        T_spatial_sel, T_spectral_sel = self.tcme(T_spatial.contiguous(), T_spectral.contiguous(), H, W)
+        if self.verbose: print(f"[FWD] TCME output -> spatial {tuple(T_spatial_sel.shape)}, spectral {tuple(T_spectral_sel.shape)}")
 
-        # --- Fusion Block (HCMFF) ---
-        if self._should_log(x):
-            print("[Flow] Passing tokens to HCMFF for frequency-domain fusion.")
-        fused_features = self.hcmff(T_spatial_sel, T_spectral_sel)
-        if self._should_log(x):
-            print(f"[FWD] HCMFF fused features -> {tuple(fused_features.shape)}")
+        # 4. Hierarchical Cross-Modal Frequency Fusion (HCMFF)
+        if self.verbose: print("[Flow] Passing tokens to HCMFF for frequency-domain fusion.")
+        # Ensure inputs to FFT are float32 and contiguous
+        fused_features = self.hcmff(T_spatial_sel.contiguous().float(), T_spectral_sel.contiguous().float())
+        if self.verbose: print(f"[FWD] HCMFF fused features -> {tuple(fused_features.shape)}")
 
-        # --- Decoder ---
-        seg_outputs = self.decoder(fused_features)
-        if self._should_log(x):
-            print("[Flow] Decoding fused representation to segmentation logits.")
-            print(f"[FWD] Decoder outputs -> keys: {list(seg_outputs.keys())}")
-        return seg_outputs
+        # 5. Decoder
+        if self.verbose: print("[Flow] Decoding fused representation to segmentation logits.")
+        # The decoder path is sensitive; ensure input is contiguous and disable cuDNN for the final head
+        with torch.backends.cudnn.flags(enabled=False):
+            outputs = self.decoder(fused_features.contiguous())
+        if self.verbose: print(f"[FWD] Decoder outputs -> keys: {list(outputs.keys())}")
+
+        return outputs

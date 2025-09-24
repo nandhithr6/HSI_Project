@@ -40,6 +40,7 @@ class SpatialTokenizer(nn.Module):
         self.embed_dim = embed_dim
         self.unfold = nn.Unfold(kernel_size=patch_size, stride=patch_size)
         self.proj = nn.Linear(in_channels * patch_size * patch_size, embed_dim)
+        self.grid_size = 0 # for debugging
 
     def forward(self, x):
         B, C, H, W = x.shape
@@ -47,8 +48,8 @@ class SpatialTokenizer(nn.Module):
         tokens = self.proj(patches)  # (B, N_patches, D)
 
         # Positional encoding
-        grid_size = int(math.sqrt(tokens.size(1)))
-        pe = get_2d_sincos_pos_embed(self.embed_dim, grid_size).to(x.device)  # (N_patches, D)
+        self.grid_size = int(math.sqrt(tokens.size(1)))
+        pe = get_2d_sincos_pos_embed(self.embed_dim, self.grid_size).to(x.device)  # (N_patches, D)
         tokens = tokens + pe.unsqueeze(0)  # (B, N_patches, D)
 
         return tokens

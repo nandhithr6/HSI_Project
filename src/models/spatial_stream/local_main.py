@@ -89,11 +89,11 @@ class ResidualSpatialBlock(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         residual = x
-        out = F.leaky_relu(self.bn1(self.conv1(x)), negative_slope=0.01, inplace=True)
+        out = F.leaky_relu(self.bn1(self.conv1(x)), negative_slope=0.01)
         out = self.cbam(out)
         out = self.bn2(self.conv2(out))
         out += residual # Add the residual connection
-        return F.leaky_relu(out, negative_slope=0.01, inplace=True) # Apply final activation
+        return F.leaky_relu(out, negative_slope=0.01) # Apply final activation
 
 # -------------------------------------
 # Helper for Adaptive 3D Convolution
@@ -104,7 +104,7 @@ class _Adaptive3DBlock(nn.Module):
     An adaptive 3D CNN block that dynamically calculates its spectral kernel size
     to perform learnable dimensional reduction.
     """
-    def __init__(self, in_ch: int, out_ch: int, in_bands: int, out_bands: int):
+    def __init__(self, in_ch: int, out_ch: int, in_bands: int, out_bands: int, stride_spatial: int = 1):
         super().__init__()
         # K = D_in - D_out + 1 (for stride=1, padding=0)
         spectral_kernel_size = in_bands - out_bands + 1
@@ -119,12 +119,20 @@ class _Adaptive3DBlock(nn.Module):
             out_channels=out_ch,
             kernel_size=(spectral_kernel_size, 3, 3), # (Depth=Bands, Height, Width)
             padding=(0, 1, 1),
+            stride=(1, stride_spatial, stride_spatial),
             bias=False
         )
         self.bn = nn.BatchNorm3d(out_ch)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return F.leaky_relu(self.bn(self.conv(x)), negative_slope=0.01, inplace=True)
+        # Forcing float32 and disabling cuDNN for maximum stability.
+        # This combination helps prevent both misaligned address and cuBLAS errors.
+        with torch.cuda.amp.autocast(enabled=False):
+            with torch.backends.cudnn.flags(enabled=False):
+                # Ensure input is contiguous and in float32 right before the convolution.
+                x_fp32 = x.contiguous().float()
+                conv_out = self.conv(x_fp32)
+        return F.leaky_relu(self.bn(conv_out), negative_slope=0.01)
 
 # -------------------------------------
 # Main Adaptive Local Stream Class
@@ -146,9 +154,10 @@ class LocalFeatureStream(nn.Module):
         # --- Static Band Reduction and Channel Progression ---
         # Bands: 37 -> 18 -> 9 -> 1
         # Channels: 1 -> 32 -> 64 -> 128
-        self.cnn3d_1 = _Adaptive3DBlock(1, 32, 37, 18)
-        self.cnn3d_2 = _Adaptive3DBlock(32, 64, 18, 9)
-        self.cnn3d_3 = _Adaptive3DBlock(64, 128, 9, 1)
+        # Add spatial stride to the first two 3D blocks to control memory: 512->256->128
+        self.cnn3d_1 = _Adaptive3DBlock(1, 32, 37, 18, stride_spatial=2)
+        self.cnn3d_2 = _Adaptive3DBlock(32, 64, 18, 9, stride_spatial=2)
+        self.cnn3d_3 = _Adaptive3DBlock(64, 128, 9, 1, stride_spatial=1)
 
         # --- Subsequent layers use final channel count ---
         final_3d_channels = 128
@@ -158,11 +167,10 @@ class LocalFeatureStream(nn.Module):
         self.conv2d_2 = nn.Conv2d(final_3d_channels, final_3d_channels, kernel_size=3, padding=1, bias=False)
         self.bn2d_2 = nn.BatchNorm2d(final_3d_channels)
 
-        self.use_checkpointing = True
-
     def _forward_impl(self, x: torch.Tensor) -> torch.Tensor:
         """Core forward logic of the module."""
         # Reshape for 3D conv: (B, Bands, H, W) -> (B, 1, Bands, H, W)
+        B, D, H, W = x.shape
         x = x.unsqueeze(1)
         
         # 3D CNN processing with learnable spectral reduction
@@ -170,13 +178,16 @@ class LocalFeatureStream(nn.Module):
         x = self.cnn3d_2(x)
         x = self.cnn3d_3(x)
 
-        # Squeeze the spectral dimension: (B, C, 1, H, W) -> (B, C, H, W)
+        # Squeeze the spectral dimension: (B, C, 1, H', W') -> (B, C, H', W')
         x = x.squeeze(2)
 
         # 2D processing (RSB-CBAM and 2D CNNs)
         x = self.rsb(x)
-        x = F.leaky_relu(self.bn2d_1(self.conv2d_1(x)), negative_slope=0.01, inplace=True)
-        x = F.leaky_relu(self.bn2d_2(self.conv2d_2(x)), negative_slope=0.01, inplace=True)
+        x = F.leaky_relu(self.bn2d_1(self.conv2d_1(x)), negative_slope=0.01)
+        x = F.leaky_relu(self.bn2d_2(self.conv2d_2(x)), negative_slope=0.01)
+        # Upsample back to original resolution to match downstream fusion
+        if x.shape[-2:] != (H, W):
+            x = F.interpolate(x, size=(H, W), mode='bilinear', align_corners=False)
         return x
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -189,8 +200,5 @@ class LocalFeatureStream(nn.Module):
         Returns:
             torch.Tensor: Output 2D feature map.
         """
-        if self.use_checkpointing and self.training:
-            return checkpoint(self._forward_impl, x, use_reentrant=False)
-        else:
-            return self._forward_impl(x)
+        return self._forward_impl(x)
 

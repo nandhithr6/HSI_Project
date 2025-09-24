@@ -17,6 +17,27 @@ from typing import Tuple, Optional, Dict, List
 import warnings
 warnings.filterwarnings('ignore')
 
+# Global one-shot logging registry to prevent repeated prints across DP replicas
+# and re-entrant forwards (e.g., from gradient checkpointing or retries).
+_HCMFF_GLOBAL_PRINT = {
+    'hcmff_header_printed': False,
+    'hms_header_printed': False,
+    'hms_body_printed': False,
+}
+
+
+def _should_log_tensor(t: torch.Tensor) -> bool:
+    """Gate prints based on the tensor's device: CPU or CUDA:0 only.
+    This avoids duplicate logs across DataParallel replicas.
+    """
+    try:
+        dev = t.device
+        if dev.type != 'cuda':
+            return True
+        return getattr(dev, 'index', None) in (None, 0)
+    except Exception:
+        return True
+
 
 # ================================================================================================
 # FREQUENCY DOMAIN TRANSFORMS - DIRECT FFT ONLY
@@ -179,7 +200,39 @@ class CrossModalFrequencyFusionCore(nn.Module):
         # Phase alignment via attention
         phase_concat = torch.cat([spatial_phase, spectral_phase], dim=-1)
         phase_proj = self.phase_proj(phase_concat)
-        aligned_phase, _ = self.phase_attention(phase_proj, phase_proj, phase_proj)
+        
+        # --- Manual Multi-Head Attention for Stability ---
+        # Forcing float32 and using the 'math' SDP kernel to prevent misaligned address errors.
+        qkv = phase_proj.contiguous().float()
+        B, N, D_total = qkv.shape
+        num_heads = self.phase_attention.num_heads
+
+        # Project and reshape for multi-head attention
+        q, k, v = qkv.chunk(3, dim=-1)
+        
+        # head_dim is calculated from the chunked tensor's dimension
+        head_dim = q.shape[-1] // num_heads
+
+        q = q.reshape(B, N, num_heads, head_dim).transpose(1, 2)
+        k = k.reshape(B, N, num_heads, head_dim).transpose(1, 2)
+        v = v.reshape(B, N, num_heads, head_dim).transpose(1, 2)
+
+        # Use safe math kernel for scaled_dot_product_attention
+        try:
+            from torch.backends.cuda import sdp_kernel
+            ctx = sdp_kernel(enable_math=True, enable_flash=False, enable_mem_efficient=False)
+        except (ImportError, AttributeError):
+            class _NoopCtx:
+                def __enter__(self): pass
+                def __exit__(self, *args): pass
+            ctx = _NoopCtx()
+
+        with ctx:
+            attn_output = F.scaled_dot_product_attention(q, k, v)
+
+        # Reshape and project back
+        aligned_phase = attn_output.transpose(1, 2).contiguous().view(B, N, D)
+        aligned_phase = self.phase_attention.out_proj(aligned_phase)
         
         return self.phase_norm(aligned_phase)
     
@@ -187,10 +240,22 @@ class CrossModalFrequencyFusionCore(nn.Module):
         """Components 3 & 4: Separate into low and high frequency parts."""
         # Reshape for 1D convolution
         fused_conv = fused_amplitude.transpose(1, 2)  # [B, D, N]
-        
-        # Extract frequency components
-        low_freq_conv = self.low_freq_filter(fused_conv)    # Global structures
-        high_freq_conv = self.high_freq_filter(fused_conv)  # Fine details
+        # Conv1d can be fragile under AMP on some CUDA backends. Force fp32 with autocast disabled.
+        orig_dtype = fused_conv.dtype
+        fused_conv_fp32 = fused_conv.float()
+        try:
+            with torch.cuda.amp.autocast(enabled=False):
+                low_freq_conv = self.low_freq_filter(fused_conv_fp32)
+                high_freq_conv = self.high_freq_filter(fused_conv_fp32)
+        except RuntimeError as e:
+            # As a last resort, retry without autocast context (already disabled) but re-cast inputs
+            # This branch is unlikely to hit, but keeps training from crashing.
+            low_freq_conv = self.low_freq_filter(fused_conv_fp32)
+            high_freq_conv = self.high_freq_filter(fused_conv_fp32)
+        # Cast outputs back to original dtype if needed (e.g., to bf16/half under AMP)
+        if orig_dtype != torch.float32:
+            low_freq_conv = low_freq_conv.to(orig_dtype)
+            high_freq_conv = high_freq_conv.to(orig_dtype)
         
         # Back to token format
         low_freq = low_freq_conv.transpose(1, 2)   # [B, N, D]
@@ -234,6 +299,7 @@ class HierarchicalMultiScaleProcessor(nn.Module):
         self.feature_dim = feature_dim
         self.scales = scales
         self.verbose = verbose
+        self._printed_once = False
         
         # Scale-specific processors
         self.scale_processors = nn.ModuleDict({
@@ -291,9 +357,11 @@ class HierarchicalMultiScaleProcessor(nn.Module):
         B, N, D = fused_amplitude.shape
         multi_scale_features = []
         
-        if self.verbose:
+        # Print header only once globally and as early as possible to avoid duplicates on re-entrant forwards
+        if self.verbose and _should_log_tensor(fused_amplitude) and not _HCMFF_GLOBAL_PRINT['hms_header_printed']:
             print(f"🔥 HIERARCHICAL MULTI-SCALE PROCESSING")
             print(f"   Processing scales: {self.scales}")
+            _HCMFF_GLOBAL_PRINT['hms_header_printed'] = True
         
         # Process each octave scale
         for i, scale in enumerate(self.scales):
@@ -310,16 +378,19 @@ class HierarchicalMultiScaleProcessor(nn.Module):
                 ).transpose(1, 2)
             
             multi_scale_features.append(processed)
-            if self.verbose:
+            if self.verbose and _should_log_tensor(processed) and not _HCMFF_GLOBAL_PRINT['hms_body_printed']:
                 print(f"   ✓ Scale {scale}: {processed.shape}")
         
         # THE FUSED WEIGHTED SUM AMPLITUDE FUSION
         final_fused_amplitude = self.fused_weighted_sum_amplitude_fusion(multi_scale_features)
         
         scale_weights = F.softmax(self.scale_attention_weights, dim=0)
-        if self.verbose:
+        if self.verbose and _should_log_tensor(final_fused_amplitude) and not _HCMFF_GLOBAL_PRINT['hms_body_printed']:
             print(f"   🎯 FUSED WEIGHTED SUM weights: {scale_weights.detach().cpu().numpy()}")
             print(f"   ✅ Final fused amplitude: {final_fused_amplitude.shape}")
+            # Mark both the instance and global body as printed to prevent duplicates
+            self._printed_once = True
+            _HCMFF_GLOBAL_PRINT['hms_body_printed'] = True
         
         return final_fused_amplitude
 
@@ -337,6 +408,7 @@ class HierarchicalCrossModalityFrequencyFusion(nn.Module):
     def __init__(self, feature_dim: int = 128, verbose: bool = False):
         super().__init__()
         self.verbose = verbose
+        self._printed_once = False
         # Direct frequency processing - no enhancement
         self.freq_transforms = FrequencyDomainTransforms(feature_dim)
         self.fusion_core = CrossModalFrequencyFusionCore(feature_dim)
@@ -352,47 +424,50 @@ class HierarchicalCrossModalityFrequencyFusion(nn.Module):
         Returns:
             final_fused_features: [B, 256, D] fused features for downstream processing
         """
-        if self.verbose:
+        # Print HCMFF header once globally (device-gated) to avoid repeats across DP replicas/retries
+        if self.verbose and _should_log_tensor(spatial_tokens) and not _HCMFF_GLOBAL_PRINT['hcmff_header_printed']:
             print(f"\n🔥 HCMFF Forward Pass - Direct Frequency Fusion")
             print(f"   📥 TCME Outputs - Spatial: {spatial_tokens.shape}, Spectral: {spectral_tokens.shape}")
+            _HCMFF_GLOBAL_PRINT['hcmff_header_printed'] = True
         
         # Stage 1: Direct Frequency Domain Transformation (NO ENHANCEMENT)
-        if self.verbose:
+        if self.verbose and _should_log_tensor(spatial_tokens) and not self._printed_once:
             print(f"\n🌊 Direct FFT Conversion")
         spatial_amp, spatial_phase = self.freq_transforms.spatial_to_frequency(spatial_tokens)
         spectral_amp, spectral_phase = self.freq_transforms.spectral_to_frequency(spectral_tokens)
-        if self.verbose:
+        if self.verbose and _should_log_tensor(spatial_tokens) and not self._printed_once:
             print(f"   ✓ Spatial FFT: amp={spatial_amp.shape}, phase={spatial_phase.shape}")
             print(f"   ✓ Spectral FFT: amp={spectral_amp.shape}, phase={spectral_phase.shape}")
         
         # Stage 2: Cross-Modal Frequency Fusion (4-component preparation)
-        if self.verbose:
+        if self.verbose and _should_log_tensor(spatial_tokens) and not self._printed_once:
             print(f"\n🔄 Cross-Modal Frequency Fusion (4-Component Prep)")
         fused_amplitude, aligned_phase, low_freq, high_freq = self.fusion_core(
             spatial_amp, spatial_phase, spectral_amp, spectral_phase
         )
-        if self.verbose:
+        if self.verbose and _should_log_tensor(spatial_tokens) and not self._printed_once:
             print(f"   ✓ Component 1 - Fused amplitude: {fused_amplitude.shape}")
             print(f"   ✓ Component 2 - Aligned phase: {aligned_phase.shape}")
             print(f"   ✓ Component 3 - Low frequency: {low_freq.shape}")
             print(f"   ✓ Component 4 - High frequency: {high_freq.shape}")
         
         # Stage 3: Hierarchical Multi-Scale Processing (THE ACTUAL FUSION)
-        if self.verbose:
+        if self.verbose and _should_log_tensor(spatial_tokens) and not self._printed_once:
             print(f"\n⚡ Hierarchical Multi-Scale Processing (ACTUAL FUSION)")
         hierarchical_features = self.hierarchical_processor(
             fused_amplitude, aligned_phase, low_freq, high_freq
         )
         
         # Stage 4: Spatial Reconstruction
-        if self.verbose:
+        if self.verbose and _should_log_tensor(spatial_tokens) and not self._printed_once:
             print(f"\n🔄 Spatial Domain Reconstruction")
         final_features = self.freq_transforms.frequency_to_spatial_reconstruction(
             hierarchical_features, aligned_phase
         )
-        if self.verbose:
+        if self.verbose and _should_log_tensor(spatial_tokens) and not self._printed_once:
             print(f"   ✅ Final output: {final_features.shape}")
             print(f"\n🎉 HCMFF Complete!")
+            self._printed_once = True
         return final_features
 
 

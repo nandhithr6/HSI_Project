@@ -16,6 +16,23 @@ Notes:
 """
 
 import os
+# Set conservative NCCL environment flags as early as possible (before CUDA init)
+os.environ.setdefault('NCCL_P2P_DISABLE', '1')          # disable direct peer-to-peer which can fail on some topologies
+os.environ.setdefault('NCCL_SHM_DISABLE', '1')          # avoid shared memory transport issues
+os.environ.setdefault('NCCL_ASYNC_ERROR_HANDLING', '1') # surface errors promptly
+os.environ.setdefault('NCCL_BLOCKING_WAIT', '1')        # make collectives blocking to simplify error handling
+os.environ.setdefault('NCCL_DEBUG', 'WARN')             # reduce chatter; set to INFO for debugging
+# Reduce CUDA memory fragmentation by enabling expandable segments by default
+os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
+import torch
+# Disable TF32 for stability; it can cause issues on Ampere GPUs.
+torch.backends.cuda.matmul.allow_tf32 = False
+torch.backends.cudnn.allow_tf32 = False
+
+# Set deterministic flags for reproducibility and stability
+torch.backends.cudnn.benchmark = False
+torch.backends.cudnn.deterministic = True
+
 import glob
 import argparse
 import random
@@ -51,6 +68,25 @@ def set_seed(seed: int):
 
 def ensure_dir(path: str):
     os.makedirs(path, exist_ok=True)
+
+
+def print_gpu_summary():
+    """Print CUDA visibility summary once to help diagnose multi-GPU usage."""
+    cuda_visible = os.environ.get('CUDA_VISIBLE_DEVICES', None)
+    print("CUDA visible devices:", cuda_visible if cuda_visible is not None else "<not set>")
+    if torch.cuda.is_available():
+        count = torch.cuda.device_count()
+        print(f"torch.cuda.device_count() = {count}")
+        for i in range(count):
+            try:
+                name = torch.cuda.get_device_name(i)
+            except Exception:
+                name = "<unknown>"
+            print(f"  GPU {i}: {name}")
+        if count <= 1:
+            print("[WARN] Only one GPU visible to PyTorch. DataParallel cannot use multiple GPUs.")
+    else:
+        print("[WARN] CUDA not available. Using CPU.")
 
 
 class CSVLogger:
@@ -119,7 +155,8 @@ class NPZHSIDataset(Dataset):
                  augment: bool = True,
                  spectral_dropout_p: float = 0.2,
                  spectral_dropout_ratio: float = 0.1,
-                 crop_size: Optional[int] = None):
+                 crop_size: Optional[int] = None,
+                 verbose: bool = False):
         self.files = files
         self.image_key = image_key
         self.mask_key = mask_key
@@ -127,22 +164,24 @@ class NPZHSIDataset(Dataset):
         self.spectral_dropout_p = spectral_dropout_p
         self.spectral_dropout_ratio = spectral_dropout_ratio
         self.crop_size = crop_size
+        self.verbose = verbose
 
-        # Discover all mask_* keys across the dataset for global class mapping
+        # Discover all mask__* keys across the dataset for global class mapping
         all_mask_keys = set()
         for f in files:
             try:
                 data = np.load(f)
-                keys = [k for k in data.keys() if k.startswith('mask_') and k != 'wavelengths']
+                keys = [k for k in data.keys() if k.startswith('mask__')]
                 all_mask_keys.update(keys)
             except Exception:
                 continue
         self.class_keys = sorted(all_mask_keys)
         self.class_map = {k: i+1 for i, k in enumerate(self.class_keys)}  # 0=background
-        if len(self.class_map) > 0:
-            print(f"[INFO] Discovered mask classes: background=0, " + ", ".join(f"{k}={v}" for k,v in self.class_map.items()))
-        else:
-            print("[WARN] No mask_* keys found in dataset; will fallback to 'mask' if present.")
+        if self.verbose:
+            if len(self.class_map) > 0:
+                print(f"[INFO] Discovered mask classes: background=0, " + ", ".join(f"{k}={v}" for k,v in self.class_map.items()))
+            else:
+                print("[WARN] No mask__* keys found in dataset; will fallback to 'mask' if present.")
 
     def __len__(self):
         return len(self.files)
@@ -315,8 +354,17 @@ def train_one_fold(fold: int,
     print(f"[Fold {fold}] Device: {device}")
 
     # Datasets/Loaders
-    train_ds = NPZHSIDataset(train_files, image_key=args.image_key, mask_key=args.mask_key, augment=True, crop_size=args.crop_size)
-    val_ds = NPZHSIDataset(val_files, image_key=args.image_key, mask_key=args.mask_key, augment=False, crop_size=args.crop_size)
+    # Keep dataset prints minimal even when --verbose-model to avoid repeated logs
+    train_ds = NPZHSIDataset(train_files, image_key=args.image_key, mask_key=args.mask_key, augment=True, crop_size=args.crop_size, verbose=False)
+    val_ds = NPZHSIDataset(val_files, image_key=args.image_key, mask_key=args.mask_key, augment=False, crop_size=args.crop_size, verbose=False)
+
+    # Derive number of classes from discovered mask keys (background=0 + discovered)
+    discovered_classes = 1 + len(getattr(train_ds, 'class_map', {}))
+    if discovered_classes <= 1:
+        discovered_classes = args.num_classes  # fallback
+    if discovered_classes != args.num_classes and args.verbose_model:
+        print(f"[Fold {fold}] Adjusting num_classes from {args.num_classes} -> {discovered_classes} based on discovered masks")
+    num_classes_model = discovered_classes
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, pin_memory=True)
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=True)
 
@@ -332,17 +380,23 @@ def train_one_fold(fold: int,
         spectral_window_sizes=args.spectral_window_sizes,
         spectral_stride=args.spectral_stride,
         spectral_pixels_per_chunk=args.spectral_pixels_per_chunk,
-        num_classes=args.num_classes,
+        num_classes=num_classes_model,
         verbose=args.verbose_model
     ).to(device)
     # Multi-GPU support
     def _unwrap(m):
         return m.module if isinstance(m, nn.DataParallel) else m
-    if torch.cuda.device_count() > 1 and args.verbose_model:
-        print(f"[Fold {fold}] Using DataParallel across {torch.cuda.device_count()} GPUs")
-        model = nn.DataParallel(model)
-    elif torch.cuda.device_count() > 1:
-        model = nn.DataParallel(model)
+    if torch.cuda.device_count() > 1:
+        total_gpus = torch.cuda.device_count()
+        if getattr(args, 'force_all_gpus', False):
+            used_gpus = total_gpus
+        else:
+            used_gpus = max(1, min(total_gpus, args.batch_size))
+        device_ids = list(range(used_gpus))
+        model = nn.DataParallel(model, device_ids=device_ids)
+        print(f"[Fold {fold}] Using DataParallel across {used_gpus}/{total_gpus} GPUs")
+        if used_gpus < total_gpus and not getattr(args, 'force_all_gpus', False):
+            print(f"[INFO] Limiting GPUs to {used_gpus} to avoid zero-size microbatches (batch={args.batch_size}).")
     if args.verbose_model:
         # One-time pipeline summary for clarity
         print("Model pipeline: [Spatial Local] + [Spatial Global] -> Fusion -> SpatialTokenizer || SpectralStream -> TCME -> HCMFF -> Decoder")
@@ -354,8 +408,8 @@ def train_one_fold(fold: int,
     # Optimizer/Scheduler/Loss
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=args.t0, T_mult=args.t_mult, eta_min=args.eta_min)
-    loss_fn = UnifiedFocalLoss(num_classes=args.num_classes, lambda_=args.lambda_u, alpha=args.alpha, gamma=args.gamma, delta=args.delta, smooth=args.smooth)
-    scaler = torch.cuda.amp.GradScaler(enabled=torch.cuda.is_available())
+    loss_fn = UnifiedFocalLoss(num_classes=num_classes_model, lambda_=args.lambda_u, alpha=args.alpha, gamma=args.gamma, delta=args.delta, smooth=args.smooth)
+    scaler = torch.cuda.amp.GradScaler(enabled=torch.cuda.is_available(), init_scale=1024)
     early = EarlyStopping(patience=args.patience, min_delta=args.min_delta)
 
     # Checkpoint dirs
@@ -386,33 +440,166 @@ def train_one_fold(fold: int,
                 set_requires_grad(_m, True)
 
         train_loss = 0.0
-        for x, y in train_loader:
+        # Enable very verbose model logs only on the first training batch per fold
+        verbose_once_done = False
+        verbose_requested = bool(getattr(args, 'verbose_model', False) or getattr(args, 'verbose_model_once', False))
+        for batch_idx, (x, y) in enumerate(train_loader):
+            # Toggle model + submodules verbose only for the very first batch of the first epoch if requested
+            try:
+                vflag = (verbose_requested and not verbose_once_done and epoch == 0 and batch_idx == 0)
+                u = _unwrap(model)
+                u.verbose = vflag
+                if hasattr(u, 'hcmff'):
+                    u.hcmff.verbose = vflag
+                if hasattr(u, 'decoder'):
+                    u.decoder.verbose = vflag
+            except Exception:
+                pass
             x = x.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True)
             optimizer.zero_grad(set_to_none=True)
-            with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
-                outputs = model(x)
-                logits = outputs['final_logits']
-                loss = loss_fn(logits, y)
+            # Forward with automatic DP->single-GPU fallback on NCCL/broadcast errors
+            def _is_nccl_broadcast_error(err: Exception) -> bool:
+                s = str(err)
+                return ('NCCL' in s) or ('broadcast_coalesced' in s) or ('nccl' in s)
+            def _is_replica_compute_error(err: Exception) -> bool:
+                s = str(err)
+                # Catch common DP replica failures
+                return ('AcceleratorError' in s) or ('misaligned address' in s) or ('CUDA error' in s)
+
+            try:
+                # If forcing all GPUs, ensure batch divisible by number of replicas by light replication
+                replicas = torch.cuda.device_count() if (torch.cuda.is_available() and isinstance(model, nn.DataParallel)) else 1
+                original_bs = x.size(0)
+                if getattr(args, 'force_all_gpus', False) and replicas > 1:
+                    rem = original_bs % replicas
+                    if rem != 0:
+                        need = replicas - rem
+                        x = torch.cat([x, x[-1:].repeat(need, 1, 1, 1)], dim=0)
+                        y = torch.cat([y, y[-1:].repeat(need, 1, 1)], dim=0)
+                with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
+                    outputs = model(x)
+                    logits = outputs['final_logits']
+                    loss = loss_fn(logits, y)
+                    # Rescale loss to account for any temporary replication so that effective batch remains original_bs
+                    if getattr(args, 'force_all_gpus', False) and replicas > 1:
+                        eff_bs = x.size(0)
+                        if eff_bs != original_bs and eff_bs > 0:
+                            loss = loss * (original_bs / float(eff_bs))
+            except RuntimeError as e:
+                if _is_nccl_broadcast_error(e) or _is_replica_compute_error(e):
+                    print(f"[Fold {fold}] [WARN] NCCL/DP error on forward: {e}. Falling back to single-GPU and retrying this batch.")
+                    # Unwrap DP and rebuild optimizer/scheduler/scaler
+                    try:
+                        # Free CUDA caches on all visible devices
+                        if torch.cuda.is_available():
+                            try:
+                                for i in range(torch.cuda.device_count()):
+                                    torch.cuda.set_device(i)
+                                    torch.cuda.empty_cache()
+                            except Exception:
+                                torch.cuda.empty_cache()
+                        # Switch to single-GPU model
+                        model = _unwrap(model).to(device)
+                        optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+                        scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=args.t0, T_mult=args.t_mult, eta_min=args.eta_min)
+                        scaler = torch.cuda.amp.GradScaler(enabled=torch.cuda.is_available())
+                        # Retry forward once
+                        with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
+                            outputs = model(x)
+                            logits = outputs['final_logits']
+                            loss = loss_fn(logits, y)
+                        print(f"[Fold {fold}] [INFO] Successfully switched to single-GPU path.")
+                    except Exception as e2:
+                        print(f"[Fold {fold}] [ERROR] Fallback forward failed: {e2}")
+                        raise
+                else:
+                    raise
+            except Exception as e:
+                # Last-chance fallback for unexpected DP replica errors
+                if _is_replica_compute_error(e):
+                    print(f"[Fold {fold}] [WARN] DP replica compute error: {e}. Falling back to single-GPU and retrying this batch.")
+                    try:
+                        if torch.cuda.is_available():
+                            try:
+                                for i in range(torch.cuda.device_count()):
+                                    torch.cuda.set_device(i)
+                                    torch.cuda.empty_cache()
+                            except Exception:
+                                torch.cuda.empty_cache()
+                        model = _unwrap(model).to(device)
+                        optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+                        scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=args.t0, T_mult=args.t_mult, eta_min=args.eta_min)
+                        scaler = torch.cuda.amp.GradScaler(enabled=torch.cuda.is_available())
+                        with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
+                            outputs = model(x)
+                            logits = outputs['final_logits']
+                            loss = loss_fn(logits, y)
+                        print(f"[Fold {fold}] [INFO] Successfully switched to single-GPU path.")
+                    except Exception as e2:
+                        print(f"[Fold {fold}] [ERROR] Fallback forward failed: {e2}")
+                        raise
+                else:
+                    raise
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.max_grad_norm)
             scaler.step(optimizer)
             scaler.update()
             train_loss += loss.item() * x.size(0)
+            verbose_once_done = True
         train_loss /= len(train_loader.dataset)
 
         # Validation
         model.eval()
+        # Silence model and submodules verbose during validation to avoid loops
+        try:
+            u = _unwrap(model)
+            u.verbose = False
+            if hasattr(u, 'hcmff'):
+                u.hcmff.verbose = False
+            if hasattr(u, 'decoder'):
+                u.decoder.verbose = False
+        except Exception:
+            pass
         val_loss = 0.0
         with torch.no_grad():
             for x, y in val_loader:
                 x = x.to(device, non_blocking=True)
                 y = y.to(device, non_blocking=True)
-                outputs = model(x)
-                logits = outputs['final_logits']
-                loss = loss_fn(logits, y)
-                val_loss += loss.item() * x.size(0)
+                # Replicate batch if forcing all GPUs so every replica gets data
+                replicas = torch.cuda.device_count() if (torch.cuda.is_available() and isinstance(model, nn.DataParallel)) else 1
+                original_bs = x.size(0)
+                if getattr(args, 'force_all_gpus', False) and replicas > 1:
+                    rem = original_bs % replicas
+                    if rem != 0:
+                        need = replicas - rem
+                        x = torch.cat([x, x[-1:].repeat(need, 1, 1, 1)], dim=0)
+                        y = torch.cat([y, y[-1:].repeat(need, 1, 1)], dim=0)
+                try:
+                    outputs = model(x)
+                    logits = outputs['final_logits']
+                    loss = loss_fn(logits, y)
+                except Exception as e:
+                    # If DP causes a replica error during eval, fall back to single GPU and retry this batch
+                    s = str(e)
+                    if ('misaligned address' in s) or ('AcceleratorError' in s) or ('CUDA error' in s) or ('NCCL' in s):
+                        try:
+                            u = _unwrap(model)
+                            outputs = u(x)
+                            logits = outputs['final_logits']
+                            loss = loss_fn(logits, y)
+                            print(f"[Fold {fold}] [INFO] Validation fallback to single-GPU succeeded for one batch.")
+                        except Exception as e2:
+                            print(f"[Fold {fold}] [ERROR] Validation fallback failed: {e2}")
+                            raise
+                    else:
+                        raise
+                if getattr(args, 'force_all_gpus', False) and replicas > 1:
+                    eff_bs = x.size(0)
+                    if eff_bs != original_bs and eff_bs > 0:
+                        loss = loss * (original_bs / float(eff_bs))
+                val_loss += loss.item() * original_bs
         val_loss /= len(val_loader.dataset)
 
         # Scheduler step (with warmup)
@@ -443,6 +630,15 @@ def train_one_fold(fold: int,
             break
 
     best = torch.load(best_path, map_location='cpu')
+    # Proactive cleanup to reduce CUDA fragmentation before next fold
+    try:
+        import gc
+        del model, train_loader, val_loader, optimizer, scheduler, scaler, loss_fn
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
     return best_path, best['val_loss']
 
 
@@ -464,7 +660,7 @@ def main():
         default=None,
         help='Root directory containing NPZ files. If omitted, uses env HSI_DATA_DIR or \'/ssd_scratch/placenta/Placenta\''
     )
-    parser.add_argument('--save-dir', type=str, default='saved/models', help='Directory to save checkpoints and weights')
+    parser.add_argument('--save-dir', type=str, default='saved/models', help='Directory to save checkpoints and weights (defaults here; no need to pass)')
     parser.add_argument('--num-classes', type=int, default=5)
     parser.add_argument('--epochs', type=int, default=60)
     parser.add_argument('--batch-size', type=int, default=4)
@@ -494,7 +690,9 @@ def main():
     parser.add_argument('--run-name', type=str, default=None, help='Optional run name suffix for logs and checkpoints')
     parser.add_argument('--progressive-unfreeze', action='store_true', help='Enable progressive unfreezing schedule')
     # Model verbosity and sizes
-    parser.add_argument('--verbose-model', action='store_true', help='Print detailed model forward pass shapes')
+    parser.add_argument('--verbose-model', action='store_true', help='Print detailed model forward pass shapes (first training batch only)')
+    # Deprecated full-loop spam; we limit verbose to first batch by default. This flag is kept for clarity.
+    parser.add_argument('--verbose-model-once', action='store_true', help='Alias: verbose model prints only once (first training batch)')
     parser.add_argument('--spatial-embed-dim', type=int, default=256, help='Spatial embedding dimension')
     parser.add_argument('--spectral-embed-dim', type=int, default=128, help='Spectral embedding dimension')
     parser.add_argument('--patch-size', type=int, default=16, help='Spatial tokenizer patch size')
@@ -503,6 +701,7 @@ def main():
     parser.add_argument('--spectral-stride', type=int, default=4, help='Stride for spectral sliding windows')
     parser.add_argument('--spectral-pixels-per-chunk', type=int, default=8192, help='Process spectral tokens in chunks to save memory')
     parser.add_argument('--crop-size', type=int, default=None, help='Optional center crop size (HxW) to reduce memory')
+    parser.add_argument('--force-all-gpus', action='store_true', help='Use all visible GPUs even if batch-size < num_gpus by replicating microbatches and scaling loss')
     args = parser.parse_args()
     # Parse spectral window sizes string into list[int]
     if isinstance(args.spectral_window_sizes, str):
@@ -521,8 +720,10 @@ def main():
     set_seed(args.seed)
     ensure_dir(args.save_dir)
     ensure_dir(args.log_dir)
+    # One-time GPU summary to clarify multi-GPU visibility
+    print_gpu_summary()
 
-    # Resolve dataset root directory with sensible ADA defaults
+    # Resolve dataset root directory with sensible ADA defaults (no need to pass flags)
     data_dir = args.data_dir or os.environ.get('HSI_DATA_DIR') or '/ssd_scratch/placenta/Placenta'
     if not os.path.exists(data_dir):
         raise FileNotFoundError(
@@ -563,8 +764,13 @@ def main():
         splits_list = list(KFold(n_splits=args.folds, shuffle=True, random_state=args.seed).split(files))
         val_idx_last = splits_list[-1][1]
         val_files = [files[i] for i in val_idx_last]
-        val_ds = NPZHSIDataset(val_files, image_key=args.image_key, mask_key=args.mask_key, mask_keys=args.mask_keys, augment=False)
+        val_ds = NPZHSIDataset(val_files, image_key=args.image_key, mask_key=args.mask_key, augment=False, verbose=args.verbose_model)
         val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=True)
+
+        # Align num_classes with discovered classes
+        discovered_classes_eval = 1 + len(getattr(val_ds, 'class_map', {}))
+        if discovered_classes_eval <= 1:
+            discovered_classes_eval = args.num_classes
 
         models_list = []
         for p in fold_paths:
@@ -581,10 +787,10 @@ def main():
                 spectral_window_sizes=args.spectral_window_sizes,
                 spectral_stride=args.spectral_stride,
                 spectral_pixels_per_chunk=args.spectral_pixels_per_chunk,
-                num_classes=args.num_classes,
+                num_classes=discovered_classes_eval,
                 verbose=args.verbose_model
             ).to(device)
-            m.load_state_dict(ckpt['state_dict'])
+            m.load_state_dict(ckpt['state_dict'], strict=False)
             m.eval()
             models_list.append(m)
 
@@ -602,8 +808,8 @@ def main():
                         logits_sum = logits_sum + logits
                 preds = torch.argmax(logits_sum, dim=1).cpu().numpy()
                 all_preds.append(preds)
-    all_preds = np.concatenate(all_preds, axis=0)
-    print("Ensemble predictions shape:", all_preds.shape)
+        all_preds = np.concatenate(all_preds, axis=0)
+        print("Ensemble predictions shape:", all_preds.shape)
 
     # Close logger
     logger.close()
