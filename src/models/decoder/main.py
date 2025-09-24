@@ -28,34 +28,30 @@ def get_device():
 def print_memory_usage(device):
     """Print memory usage"""
     if device.type == 'cuda':
-        print(f"CUDA Memory: {torch.cuda.memory_allocated() / 1024**2:.2f} MB")
-    elif device.type == 'mps':
-        print(f"MPS Memory: {torch.mps.current_allocated_memory() / 1024**2:.2f} MB")
-    else:
-        print("CPU mode - no GPU memory tracking")
+        self.token_converter = TokenToFeatureConverter(
+            input_dim=input_token_dim, output_dim=input_token_dim, spatial_size=32
+        )
+        print("   ✓ Token-to-Feature Converter")
 
-# =================== CORE COMPONENTS ===================
-
-class TokenToFeatureConverter(nn.Module):
-    """Stage 1: Token-to-Feature Conversion with Cross-Modal Integration"""
-    
-    def __init__(self, input_dim: int = 256, output_dim: int = 512, 
-                 spatial_size: int = 32):
-        super().__init__()
-        self.input_dim = input_dim
-        self.output_dim = output_dim
-        self.spatial_size = spatial_size
-        
-        # Adaptive Token Embedding
-        self.token_linear = nn.Linear(input_dim, output_dim)
-        
-        # 2D Positional Encoding
-        self.register_buffer('pos_encoding', 
-                           self._generate_2d_pos_encoding(spatial_size, output_dim))
-        
-        # Cross-Modal Feature Integration
-        self.cross_attention = nn.MultiheadAttention(
-            embed_dim=output_dim, num_heads=8, batch_first=True, dropout=0.1
+        # Stage 2: Hierarchical Upsampling with Cross-Scale Attention
+        self.upsample1 = nn.ConvTranspose2d(input_token_dim, input_token_dim // 2, 2, stride=2)
+        self.transformer1 = TransformerBlock(input_token_dim // 2, num_heads=8)
+        self.norm1 = nn.LayerNorm(input_token_dim // 2)
+        self.upsample2 = nn.ConvTranspose2d(input_token_dim // 2, input_token_dim // 2, 2, stride=2)
+        self.cross_attn2 = CrossScaleAttention(input_token_dim // 2, num_heads=8)
+        self.transformer2 = TransformerBlock(input_token_dim // 2, num_heads=8)
+        self.upsample3 = nn.ConvTranspose2d(input_token_dim // 2, input_token_dim // 4, 2, stride=2)
+        self.multi_fusion3 = MultiScaleFusion(num_scales=3, feature_dim=input_token_dim // 4)
+        self.transformer3 = TransformerBlock(input_token_dim // 4, num_heads=8)
+        self.upsample4 = nn.ConvTranspose2d(input_token_dim // 4, input_token_dim // 8, 2, stride=2)
+        self.final_refine = nn.Sequential(
+            nn.Conv2d(input_token_dim // 8, input_token_dim // 8, 3, padding=1),
+            nn.BatchNorm2d(input_token_dim // 8),
+            nn.GELU(),
+            nn.Conv2d(input_token_dim // 8, input_token_dim // 8, 1)
+        )
+        self.seg_head = HierarchicalSegmentationHead(
+            feature_dim=input_token_dim // 8, num_classes=num_classes
         )
         self.layer_norm = nn.LayerNorm(output_dim)
         

@@ -89,11 +89,12 @@ class SpectralStream(nn.Module):
     """
     The complete Spectral Stream module.
     """
-    def __init__(self, num_bands: int, embed_dim: int = 128, window_sizes: list = [8, 16, 32], stride: int = 4):
+    def __init__(self, num_bands: int, embed_dim: int = 128, window_sizes: list = [8, 16, 32], stride: int = 4, pixels_per_chunk: int = 8192):
         super().__init__()
         self.num_bands = num_bands
         self.window_sizes = window_sizes
         self.stride = stride
+        self.pixels_per_chunk = pixels_per_chunk
 
         self.mamba_blocks = nn.ModuleDict()
         mamba_output_dim = 0
@@ -121,17 +122,27 @@ class SpectralStream(nn.Module):
             raise ValueError(f"Input tensor has {Bands} bands, but model was initialized with {self.num_bands}.")
 
         x_flat = x.permute(0, 2, 3, 1).contiguous().view(-1, self.num_bands)
+        N = x_flat.size(0)
+        ppc = max(1024, int(self.pixels_per_chunk))
 
-        mamba_outputs = []
-        for ws in self.window_sizes:
-            windows = sliding_windows_gpu(x_flat, window_size=ws, stride=self.stride)
-            mamba_out = self.mamba_blocks[f'mamba_ws{ws}'](windows)
-            mamba_outputs.append(mamba_out.flatten(start_dim=1))
+        tokens_chunks = []
+        for start in range(0, N, ppc):
+            end = min(start + ppc, N)
+            x_chunk = x_flat[start:end]
 
-        concatenated_features = torch.cat(mamba_outputs, dim=1)
-        tokens = self.tokenizer_projection(concatenated_features)
+            mamba_outputs = []
+            for ws in self.window_sizes:
+                windows = sliding_windows_gpu(x_chunk, window_size=ws, stride=self.stride)
+                mamba_out = self.mamba_blocks[f'mamba_ws{ws}'](windows)
+                mamba_outputs.append(mamba_out.flatten(start_dim=1))
 
-        # --- CORRECTED: Reshape for 2D PE application ---
+            concatenated_features = torch.cat(mamba_outputs, dim=1)
+            tokens_chunk = self.tokenizer_projection(concatenated_features)
+            tokens_chunks.append(tokens_chunk)
+
+        tokens = torch.cat(tokens_chunks, dim=0)
+
+        # --- Reshape for 2D PE application ---
         # (N, D) -> (B, H, W, D)
         tokens_2d = tokens.view(B, H, W, -1)
         

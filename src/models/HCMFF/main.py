@@ -27,7 +27,7 @@ class FrequencyDomainTransforms(nn.Module):
     def __init__(self, feature_dim: int = 128):
         super().__init__()
         self.feature_dim = feature_dim
-        self.spatial_h = self.spatial_w = 16  # 16x16 = 256 patches for 512x512 image
+        self.spatial_h = self.spatial_w = 16  # default 16x16 grid when applicable (N==256)
         
     def spatial_to_frequency(self, spatial_tokens: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -39,33 +39,34 @@ class FrequencyDomainTransforms(nn.Module):
             spatial_amplitude: [B, 16, 16, D] frequency amplitude
             spatial_phase: [B, 16, 16, D] frequency phase
         """
-        B, N, D = spatial_tokens.shape  # [B, 256, D]
-        
-        # Direct reshape to 2D spatial grid for FFT
-        spatial_2d = spatial_tokens.view(B, self.spatial_h, self.spatial_w, D)
-        
-        # Direct FFT - no enhancement
-        freq_spatial = torch.fft.fft2(spatial_2d, dim=(1, 2))
-        
-        # Extract amplitude and phase
-        spatial_amplitude = freq_spatial.abs()
-        spatial_phase = freq_spatial.angle()
-        
-        return spatial_amplitude, spatial_phase
+        B, N, D = spatial_tokens.shape
+        # If tokens count matches the default grid (16x16), use 2D FFT. Otherwise, fall back to 1D FFT over sequence.
+        if N == self.spatial_h * self.spatial_w:
+            spatial_2d = spatial_tokens.view(B, self.spatial_h, self.spatial_w, D)
+            freq_spatial = torch.fft.fft2(spatial_2d, dim=(1, 2))
+            spatial_amplitude = freq_spatial.abs()
+            spatial_phase = freq_spatial.angle()
+            return spatial_amplitude, spatial_phase  # shapes [B, 16, 16, D]
+        else:
+            # 1D FFT along token axis when no square grid is available
+            freq_seq = torch.fft.fft(spatial_tokens, dim=1)
+            return freq_seq.abs(), freq_seq.angle()  # shapes [B, N, D]
     
     def spectral_to_frequency(self, spectral_tokens: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Direct spectral FFT conversion - NO ENHANCEMENT.
-        
+        Handles cuFFT power-of-two limitation for float16 by casting to float32 if needed.
         Args:
             spectral_tokens: [B, N, D] compressed spectral tokens from TCME
         Returns:
             spectral_amplitude: [B, N, D] spectral frequency amplitude
             spectral_phase: [B, N, D] spectral frequency phase
         """
-        # Direct FFT - no enhancement
+        N = spectral_tokens.shape[1]
+        # If float16 and not power of two, cast to float32 to avoid cuFFT error
+        if spectral_tokens.dtype == torch.float16 and (N & (N - 1)) != 0:
+            spectral_tokens = spectral_tokens.float()
         freq_spectral = torch.fft.fft(spectral_tokens, dim=1)
-        
         return freq_spectral.abs(), freq_spectral.angle()
     
     def frequency_to_spatial_reconstruction(self, final_amplitude: torch.Tensor, 
@@ -123,8 +124,8 @@ class CrossModalFrequencyFusionCore(nn.Module):
             embed_dim=feature_dim, num_heads=num_heads, 
             batch_first=True, dropout=0.0
         )
-        self.phase_proj = nn.Linear(256, feature_dim)  # For phase concatenation
-        
+        self.phase_proj = nn.Linear(2 * feature_dim, feature_dim)  # For phase concatenation
+
         # Components 3 & 4: Low and high frequency filters
         self.low_freq_filter = nn.Sequential(
             nn.Conv1d(feature_dim, feature_dim, kernel_size=7, padding=3),
@@ -136,7 +137,7 @@ class CrossModalFrequencyFusionCore(nn.Module):
             nn.BatchNorm1d(feature_dim),
             nn.GELU()
         )
-        
+
         # Normalization layers
         self.amp_norm = nn.LayerNorm(feature_dim)
         self.phase_norm = nn.LayerNorm(feature_dim)
@@ -227,11 +228,12 @@ class CrossModalFrequencyFusionCore(nn.Module):
 class HierarchicalMultiScaleProcessor(nn.Module):
     """The CORE INNOVATION: Hierarchical Multi-Scale Processing with octave scales [1,2,4,8]."""
     
-    def __init__(self, feature_dim: int = 128, scales: List[int] = [1, 2, 4, 8]):
+    def __init__(self, feature_dim: int = 128, scales: List[int] = [1, 2, 4, 8], verbose: bool = False):
         super().__init__()
         
         self.feature_dim = feature_dim
         self.scales = scales
+        self.verbose = verbose
         
         # Scale-specific processors
         self.scale_processors = nn.ModuleDict({
@@ -289,8 +291,9 @@ class HierarchicalMultiScaleProcessor(nn.Module):
         B, N, D = fused_amplitude.shape
         multi_scale_features = []
         
-        print(f"🔥 HIERARCHICAL MULTI-SCALE PROCESSING")
-        print(f"   Processing scales: {self.scales}")
+        if self.verbose:
+            print(f"🔥 HIERARCHICAL MULTI-SCALE PROCESSING")
+            print(f"   Processing scales: {self.scales}")
         
         # Process each octave scale
         for i, scale in enumerate(self.scales):
@@ -307,14 +310,16 @@ class HierarchicalMultiScaleProcessor(nn.Module):
                 ).transpose(1, 2)
             
             multi_scale_features.append(processed)
-            print(f"   ✓ Scale {scale}: {processed.shape}")
+            if self.verbose:
+                print(f"   ✓ Scale {scale}: {processed.shape}")
         
         # THE FUSED WEIGHTED SUM AMPLITUDE FUSION
         final_fused_amplitude = self.fused_weighted_sum_amplitude_fusion(multi_scale_features)
         
         scale_weights = F.softmax(self.scale_attention_weights, dim=0)
-        print(f"   🎯 FUSED WEIGHTED SUM weights: {scale_weights.detach().cpu().numpy()}")
-        print(f"   ✅ Final fused amplitude: {final_fused_amplitude.shape}")
+        if self.verbose:
+            print(f"   🎯 FUSED WEIGHTED SUM weights: {scale_weights.detach().cpu().numpy()}")
+            print(f"   ✅ Final fused amplitude: {final_fused_amplitude.shape}")
         
         return final_fused_amplitude
 
@@ -329,22 +334,13 @@ class HierarchicalCrossModalityFrequencyFusion(nn.Module):
     Takes compressed tokens from TCME and performs direct frequency fusion.
     """
     
-    def __init__(self, feature_dim: int = 128):
+    def __init__(self, feature_dim: int = 128, verbose: bool = False):
         super().__init__()
-        
-        print("🚀 Initializing HCMFF (No Enhancement Version)...")
-        
+        self.verbose = verbose
         # Direct frequency processing - no enhancement
         self.freq_transforms = FrequencyDomainTransforms(feature_dim)
-        print("   ✓ Frequency transforms (direct FFT)")
-        
         self.fusion_core = CrossModalFrequencyFusionCore(feature_dim)
-        print("   ✓ Cross-modal fusion core (4-component prep)")
-        
-        self.hierarchical_processor = HierarchicalMultiScaleProcessor(feature_dim)
-        print("   ✓ Hierarchical processor (actual fusion)")
-        
-        print("🎯 HCMFF initialization complete - Ready for TCME outputs!")
+        self.hierarchical_processor = HierarchicalMultiScaleProcessor(feature_dim, verbose=verbose)
     
     def forward(self, spatial_tokens: torch.Tensor, spectral_tokens: torch.Tensor) -> torch.Tensor:
         """
@@ -356,40 +352,47 @@ class HierarchicalCrossModalityFrequencyFusion(nn.Module):
         Returns:
             final_fused_features: [B, 256, D] fused features for downstream processing
         """
-        print(f"\n🔥 HCMFF Forward Pass - Direct Frequency Fusion")
-        print(f"   📥 TCME Outputs - Spatial: {spatial_tokens.shape}, Spectral: {spectral_tokens.shape}")
+        if self.verbose:
+            print(f"\n🔥 HCMFF Forward Pass - Direct Frequency Fusion")
+            print(f"   📥 TCME Outputs - Spatial: {spatial_tokens.shape}, Spectral: {spectral_tokens.shape}")
         
         # Stage 1: Direct Frequency Domain Transformation (NO ENHANCEMENT)
-        print(f"\n🌊 Direct FFT Conversion")
+        if self.verbose:
+            print(f"\n🌊 Direct FFT Conversion")
         spatial_amp, spatial_phase = self.freq_transforms.spatial_to_frequency(spatial_tokens)
         spectral_amp, spectral_phase = self.freq_transforms.spectral_to_frequency(spectral_tokens)
-        print(f"   ✓ Spatial FFT: amp={spatial_amp.shape}, phase={spatial_phase.shape}")
-        print(f"   ✓ Spectral FFT: amp={spectral_amp.shape}, phase={spectral_phase.shape}")
+        if self.verbose:
+            print(f"   ✓ Spatial FFT: amp={spatial_amp.shape}, phase={spatial_phase.shape}")
+            print(f"   ✓ Spectral FFT: amp={spectral_amp.shape}, phase={spectral_phase.shape}")
         
         # Stage 2: Cross-Modal Frequency Fusion (4-component preparation)
-        print(f"\n🔄 Cross-Modal Frequency Fusion (4-Component Prep)")
+        if self.verbose:
+            print(f"\n🔄 Cross-Modal Frequency Fusion (4-Component Prep)")
         fused_amplitude, aligned_phase, low_freq, high_freq = self.fusion_core(
             spatial_amp, spatial_phase, spectral_amp, spectral_phase
         )
-        print(f"   ✓ Component 1 - Fused amplitude: {fused_amplitude.shape}")
-        print(f"   ✓ Component 2 - Aligned phase: {aligned_phase.shape}")
-        print(f"   ✓ Component 3 - Low frequency: {low_freq.shape}")
-        print(f"   ✓ Component 4 - High frequency: {high_freq.shape}")
+        if self.verbose:
+            print(f"   ✓ Component 1 - Fused amplitude: {fused_amplitude.shape}")
+            print(f"   ✓ Component 2 - Aligned phase: {aligned_phase.shape}")
+            print(f"   ✓ Component 3 - Low frequency: {low_freq.shape}")
+            print(f"   ✓ Component 4 - High frequency: {high_freq.shape}")
         
         # Stage 3: Hierarchical Multi-Scale Processing (THE ACTUAL FUSION)
-        print(f"\n⚡ Hierarchical Multi-Scale Processing (ACTUAL FUSION)")
+        if self.verbose:
+            print(f"\n⚡ Hierarchical Multi-Scale Processing (ACTUAL FUSION)")
         hierarchical_features = self.hierarchical_processor(
             fused_amplitude, aligned_phase, low_freq, high_freq
         )
         
         # Stage 4: Spatial Reconstruction
-        print(f"\n🔄 Spatial Domain Reconstruction")
+        if self.verbose:
+            print(f"\n🔄 Spatial Domain Reconstruction")
         final_features = self.freq_transforms.frequency_to_spatial_reconstruction(
             hierarchical_features, aligned_phase
         )
-        print(f"   ✅ Final output: {final_features.shape}")
-        
-        print(f"\n🎉 HCMFF Complete!")
+        if self.verbose:
+            print(f"   ✅ Final output: {final_features.shape}")
+            print(f"\n🎉 HCMFF Complete!")
         return final_features
 
 
