@@ -22,6 +22,22 @@ import torch.nn.functional as F
 import math
 import time
 from typing import Tuple, List, Optional, Dict
+class _NoopCtx:
+    def __enter__(self):
+        return self
+    def __exit__(self, *args):
+        return False
+
+def _sdpa_ctx(enable_flash=True, enable_math=False, enable_mem_efficient=True):
+    try:
+        from torch.nn.attention import sdpa_kernel as _sdpa
+        return _sdpa(enable_flash=enable_flash, enable_math=enable_math, enable_mem_efficient=enable_mem_efficient)
+    except Exception:
+        try:
+            from torch.backends.cuda import sdp_kernel as _legacy
+            return _legacy(enable_flash=enable_flash, enable_math=enable_math, enable_mem_efficient=enable_mem_efficient)
+        except Exception:
+            return _NoopCtx()
 
 # =================== HELPER MODULES ===================
 
@@ -93,7 +109,7 @@ class TransformerBlock(nn.Module):
         else:
             x_flat = x
             
-        with torch.backends.cuda.sdp_kernel(enable_flash=True, enable_math=False, enable_mem_efficient=True):
+        with _sdpa_ctx(enable_flash=True, enable_math=False, enable_mem_efficient=True):
             attn_out, _ = self.attention(x_flat, x_flat, x_flat, need_weights=False)
         x_flat = self.norm1(x_flat + attn_out)
         
@@ -124,7 +140,7 @@ class CrossScaleAttention(nn.Module):
         if self.prev_proj is not None:
             prev_flat = self.prev_proj(prev_flat)
 
-        with torch.backends.cuda.sdp_kernel(enable_flash=True, enable_math=False, enable_mem_efficient=True):
+        with _sdpa_ctx(enable_flash=True, enable_math=False, enable_mem_efficient=True):
             attn_out, _ = self.attention(current_flat, prev_flat, prev_flat, need_weights=False)
         output = self.norm(current_flat + attn_out)
         

@@ -23,6 +23,7 @@ from .spatial_stream import (
 )
 from .spectral_stream.main import SpectralStream
 from .TCME.main import TokenCrossModalEnhancer
+from .HCMFF.main import HierarchicalCrossModalityFrequencyFusion
 from .decoder.main import MSTDHSHDecoder
 
 
@@ -78,6 +79,11 @@ class HSIModel(nn.Module):
         self.decoder = None
         self.num_classes = num_classes
         self.patch_size = patch_size
+        # --- Optional HCMFF path ---
+        self.hcmff = None
+        self.hcmff_token_proj = None  # lazy, projects sequence length N->K for HCMFF compute control
+        if self.use_hcmff:
+            self.hcmff = HierarchicalCrossModalityFrequencyFusion(feature_dim=spatial_embed_dim, verbose=verbose)
 
         if self.verbose:
             print("[Init] Model V2: Patch-Based Architecture")
@@ -113,16 +119,44 @@ class HSIModel(nn.Module):
             print(f"[FWD] Spatial Tokens -> {tuple(spatial_tokens.shape)}")
             print(f"[FWD] Spectral Tokens -> {tuple(spectral_tokens.shape)}")
 
-        # --- 3. Align Dimensions & Fuse with TCME ---
+        # --- 3. Fusion (HCMFF if enabled, otherwise TCME) ---
         if self._align_dims:
             spectral_tokens = self.spec_proj(spectral_tokens)
             if self._should_log(x):
                 print(f"[Flow] Aligned spectral tokens to dim {self.decoder_input_dim}")
 
-        fused_tokens = self.tcme(spatial_tokens, spectral_tokens)
+        if self.use_hcmff and (self.hcmff is not None):
+            # Optional token compression to control HCMFF compute
+            target_tokens = int(self.hcmff_tokens) if getattr(self, 'hcmff_tokens', None) else None
+            def _compress_seq(tokens: torch.Tensor, K: int) -> torch.Tensor:
+                # tokens: (B, N, D) -> (B, D, N) -> Linear(N->K) -> (B, K, D)
+                if K is None or tokens.size(1) == K:
+                    return tokens
+                N = tokens.size(1)
+                if (self.hcmff_token_proj is None) or (self.hcmff_token_proj.in_features != N) or (self.hcmff_token_proj.out_features != K):
+                    self.hcmff_token_proj = nn.Linear(N, K).to(tokens.device)
+                t = tokens.transpose(1, 2)
+                t = self.hcmff_token_proj(t)
+                return t.transpose(1, 2)
+
+            if target_tokens is not None:
+                spatial_for_fusion = _compress_seq(spatial_tokens, target_tokens)
+                spectral_for_fusion = _compress_seq(spectral_tokens, target_tokens)
+            else:
+                spatial_for_fusion = spatial_tokens
+                spectral_for_fusion = spectral_tokens
+
+            if self._should_log(x):
+                print(f"[FWD] HCMFF in Spatial -> {tuple(spatial_for_fusion.shape)} | Spectral -> {tuple(spectral_for_fusion.shape)}")
+            fused_tokens = self.hcmff(spatial_for_fusion, spectral_for_fusion)
+            if self._should_log(x):
+                print("[Flow] HCMFF fusion complete.")
+        else:
+            fused_tokens = self.tcme(spatial_tokens, spectral_tokens)
+            if self._should_log(x):
+                print("[Flow] TCME fusion complete.")
         
         if self._should_log(x):
-            print("[Flow] TCME fusion complete.")
             print(f"[FWD] Fused Tokens for Decoder -> {tuple(fused_tokens.shape)}")
         
         # --- 4. Decoder (with dynamic initialization) ---
@@ -139,7 +173,7 @@ class HSIModel(nn.Module):
             
             if self._should_log(x):
                 print("[Flow] Dynamically initialized decoder.")
-                print(f"       - Input Tokens: {num_fused_tokens}")
+                print(f"       - Decoder expects tokens: {num_fused_tokens}")
                 print(f"       - Token Dim: {token_dim}")
 
         seg_outputs = self.decoder(fused_tokens)

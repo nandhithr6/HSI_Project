@@ -54,7 +54,7 @@ torch.backends.cudnn.allow_tf32 = False
 torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
 
-# Preferred SDPA kernel: try legacy CUDA sdp_kernel (with known signature); otherwise no-op
+    # Preferred SDPA kernel: try new torch.nn.attention.sdpa_kernel; fallback to legacy torch.backends.cuda.sdp_kernel; otherwise no-op
 class _NoopCtx:
     def __enter__(self):
         return self
@@ -62,12 +62,18 @@ class _NoopCtx:
         return False
 
 def _sdpa_mem_eff_ctx():
+    # Try new API first
+    try:
+        from torch.nn.attention import sdpa_kernel as _sdpa
+        return _sdpa(enable_math=False, enable_flash=False, enable_mem_efficient=True)
+    except Exception:
+        pass
+    # Fallback to legacy API
     try:
         from torch.backends.cuda import sdp_kernel as _legacy_sdp
         try:
             return _legacy_sdp(enable_math=False, enable_flash=False, enable_mem_efficient=True)
         except TypeError:
-            # Newer torch may change signature; fall back to no-op
             return _NoopCtx()
     except Exception:
         return _NoopCtx()
@@ -377,6 +383,7 @@ def train_one_run(
     logger: Optional[CSVLogger]
 ) -> Tuple[str, float]:
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    # No TensorBoard writer (disabled per user request)
 
     # Datasets / Loaders
     want_paths = bool(getattr(args, 'very_verbose', False) or getattr(args, 'print_batch_files', False))
@@ -413,8 +420,14 @@ def train_one_run(
         return torch.stack(xs, dim=0), torch.stack(ys, dim=0), list(ps)
 
     collate_fn = _collate_with_paths if want_paths else None
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, pin_memory=True, collate_fn=collate_fn)
-    val_loader = DataLoader(val_ds, batch_size=max(1, args.batch_size//2), shuffle=False, num_workers=args.num_workers, pin_memory=True, collate_fn=collate_fn)
+    # Loader kwargs (keep simple)
+    dl_common = {
+        'num_workers': args.num_workers,
+        'pin_memory': True,
+        'collate_fn': collate_fn,
+    }
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, **dl_common)
+    val_loader = DataLoader(val_ds, batch_size=max(1, args.batch_size//2), shuffle=False, **dl_common)
 
     # Determine number of classes
     if len(train_ds.class_map) > 0:
@@ -444,6 +457,16 @@ def train_one_run(
         use_hcmff=getattr(args, 'use_hcmff', False),
         hcmff_tokens=getattr(args, 'hcmff_tokens', 256)
     ).to(device)
+
+    # channels_last disabled per request
+
+    # Optional compile (must happen before DataParallel)
+    if getattr(args, 'compile_model', False):
+        try:
+            model = torch.compile(model, mode='reduce-overhead', fullgraph=False)  # best effort
+            print("[Perf] torch.compile enabled")
+        except Exception as e:
+            print(f"[Perf] torch.compile failed (continuing uncompiled): {e}")
 
     # Multi-GPU support
     if torch.cuda.is_available() and torch.cuda.device_count() > 1:
@@ -476,6 +499,50 @@ def train_one_run(
     best_path = os.path.join(args.save_dir, "best.pt")
     last_path = os.path.join(args.save_dir, "last.pt")
 
+    # Optional auto-resume
+    start_epoch = 0
+    if getattr(args, 'resume', ''):
+        ckpt_path = None
+        if args.resume.strip().lower() == 'auto':
+            if os.path.exists(last_path):
+                ckpt_path = last_path
+            elif os.path.exists(best_path):
+                ckpt_path = best_path
+        elif os.path.exists(args.resume):
+            ckpt_path = args.resume
+        if ckpt_path is not None:
+            print(f"[Resume] Loading checkpoint from {ckpt_path}")
+            try:
+                ckpt = torch.load(ckpt_path, map_location='cpu')
+                state = ckpt.get('state_dict', None)
+                if state is None and isinstance(ckpt, dict):
+                    state = ckpt
+                if state is not None:
+                    _unwrap(model).load_state_dict(state, strict=False)
+                # Try optimizer/scheduler/scaler if present
+                try:
+                    if 'optimizer' in ckpt:
+                        optimizer.load_state_dict(ckpt['optimizer'])
+                except Exception: pass
+                try:
+                    if 'scheduler' in ckpt:
+                        scheduler.load_state_dict(ckpt['scheduler'])
+                except Exception: pass
+                try:
+                    if 'scaler' in ckpt and hasattr(scaler, 'load_state_dict'):
+                        scaler.load_state_dict(ckpt['scaler'])
+                except Exception: pass
+                # Seed early stopping best with last val_loss
+                if 'val_loss' in ckpt:
+                    try:
+                        early.best = float(ckpt['val_loss'])
+                    except Exception:
+                        pass
+                start_epoch = int(ckpt.get('epoch', -1)) + 1
+                print(f"[Resume] Resuming from epoch {start_epoch}")
+            except Exception as e:
+                print(f"[Resume] Failed to load checkpoint: {e}")
+
     # Optional freezing schedule (disabled by default)
     def set_requires_grad(module: nn.Module, requires_grad: bool):
         for p in module.parameters():
@@ -495,7 +562,7 @@ def train_one_run(
                 'params_million','flops_gmac','val_time_sec','gpu_mem_mb'
             ])
 
-    for epoch in range(args.epochs):
+    for epoch in range(start_epoch, args.epochs):
         model.train()
         if args.progressive_unfreeze:
             _m = _unwrap(model)
@@ -510,9 +577,21 @@ def train_one_run(
             else:
                 set_requires_grad(_m, True)
 
+        # Epoch start summaries
+        try:
+            print(f"[Epoch {epoch+1}] Train: batches={len(train_loader)}, dataset={len(train_loader.dataset)}")
+        except Exception:
+            pass
+
         train_loss = 0.0
+        seen_train = 0
         verbose_once_done = False
-        verbose_requested = bool(getattr(args, 'verbose_model', False) or getattr(args, 'verbose_model_once', False))
+        # Enable model workflow shape tracing either via explicit flags or when very-verbose is requested
+        verbose_requested = bool(
+            getattr(args, 'verbose_model', False)
+            or getattr(args, 'verbose_model_once', False)
+            or getattr(args, 'very_verbose', False)
+        )
 
         for batch_idx, batch in enumerate(train_loader):
             if want_paths:
@@ -608,6 +687,11 @@ def train_one_run(
                     eff_bs = x.size(0)
                     if eff_bs != original_bs and eff_bs > 0:
                         loss = loss * (original_bs / float(eff_bs))
+                # Update seen count with original (pre-replication) batch size
+                try:
+                    seen_train += int(original_bs)
+                except Exception:
+                    pass
                 # Per-batch verbose progress
                 if getattr(args, 'very_verbose', False) and ((batch_idx % max(1, args.progress_interval)) == 0):
                     seen = min((batch_idx + 1) * original_bs, len(train_loader.dataset))
@@ -690,6 +774,15 @@ def train_one_run(
             verbose_once_done = True
 
         train_loss /= max(1, len(train_loader.dataset))
+        # Epoch end summary (train)
+        try:
+            tmsg = f"[Epoch {epoch+1}] Train seen {seen_train}/{len(train_loader.dataset)} samples"
+            print(tmsg)
+            if batch_log_path is not None:
+                with open(batch_log_path, 'a') as bf:
+                    bf.write(tmsg + "\n")
+        except Exception:
+            pass
 
         # Validation
         model.eval()
@@ -718,11 +811,25 @@ def train_one_run(
         hd_list = []
         hd95_list = []
         with torch.no_grad():
+            try:
+                print(f"[Epoch {epoch+1}] Val: batches={len(val_loader)}, dataset={len(val_loader.dataset)}")
+            except Exception:
+                pass
+            seen_val = 0
             for vb_idx, vb in enumerate(val_loader):
                 if want_paths:
                     x, y, vpaths = vb
                 else:
                     x, y = vb
+                # Verbose workflow tracing on first validation batch
+                try:
+                    vflag = (getattr(args, 'very_verbose', False) or getattr(args, 'verbose_model', False)) and (epoch == 0 and vb_idx == 0)
+                    u = _unwrap(model)
+                    u.verbose = vflag
+                    if hasattr(u, 'decoder'):
+                        u.decoder.verbose = vflag
+                except Exception:
+                    pass
                 x = ensure_chw_batch(x).to(device, non_blocking=True)
                 y = y.to(device, non_blocking=True)
                 replicas = torch.cuda.device_count() if (torch.cuda.is_available() and isinstance(model, nn.DataParallel)) else 1
@@ -771,6 +878,10 @@ def train_one_run(
                     eff_bs = x.size(0)
                     if eff_bs != original_bs and eff_bs > 0:
                         loss = loss * (original_bs / float(eff_bs))
+                try:
+                    seen_val += int(original_bs)
+                except Exception:
+                    pass
                 val_loss += loss.item() * original_bs
                 # Metrics update
                 preds = torch.argmax(logits, dim=1)
@@ -805,6 +916,15 @@ def train_one_run(
                             if not np.isnan(hd): hd_list.append(hd)
                             if not np.isnan(hd95): hd95_list.append(hd95)
         val_loss /= max(1, len(val_loader.dataset))
+        # Epoch end summary (val)
+        try:
+            vmsg = f"[Epoch {epoch+1}] Val   seen {seen_val}/{len(val_loader.dataset)} samples"
+            print(vmsg)
+            if batch_log_path is not None:
+                with open(batch_log_path, 'a') as bf:
+                    bf.write(vmsg + "\n")
+        except Exception:
+            pass
 
         # Aggregate metrics
         cm_np = cm_accum.numpy()
@@ -904,11 +1024,22 @@ def train_one_run(
         if logger is not None:
             logger.log_epoch(epoch + 1, train_loss, val_loss, current_lr)
 
-        # Checkpointing
+        # Checkpointing (extended last.pt for resume state)
         state = _unwrap(model).state_dict()
-        if (not os.path.exists(best_path)) or (val_loss < torch.load(best_path, map_location='cpu').get('val_loss', float('inf'))):
+        try:
+            prev_best = torch.load(best_path, map_location='cpu').get('val_loss', float('inf')) if os.path.exists(best_path) else float('inf')
+        except Exception:
+            prev_best = float('inf')
+        if (val_loss < prev_best):
             torch.save({'state_dict': state, 'val_loss': val_loss, 'epoch': epoch}, best_path)
-        torch.save({'state_dict': state, 'val_loss': val_loss, 'epoch': epoch}, last_path)
+        torch.save({
+            'state_dict': state,
+            'val_loss': val_loss,
+            'epoch': epoch,
+            'optimizer': optimizer.state_dict(),
+            'scheduler': scheduler.state_dict(),
+            'scaler': (scaler.state_dict() if hasattr(scaler, 'state_dict') else {})
+        }, last_path)
 
         if early.step(val_loss):
             print(f"Early stopping at epoch {epoch+1}")
@@ -1056,6 +1187,9 @@ def main():
     parser.add_argument('--spectral-pixels-per-chunk', type=int, default=8192, help='Process spectral tokens in chunks to save memory')
     parser.add_argument('--crop-size', type=int, default=512, help='Optional center crop size (HxW) to reduce memory')
     parser.add_argument('--force-all-gpus', action='store_true', help='Use all visible GPUs even if batch-size < num_gpus by replicating microbatches and scaling loss')
+    # Performance / quality-of-life flags
+    parser.add_argument('--fast-mode', action='store_true', help='Enable TF32 and cudnn.benchmark for faster training (non-deterministic)')
+    parser.add_argument('--compile-model', action='store_true', help='Attempt torch.compile for performance (best effort)')
     # Optional HCMFF fusion path
     parser.add_argument('--use-hcmff', action='store_true', help='Use HCMFF fusion (compresses tokens to --hcmff-tokens before fusion)')
     parser.add_argument('--hcmff-tokens', type=int, default=256, help='Number of tokens to use for HCMFF after compression (compute control)')
@@ -1065,7 +1199,19 @@ def main():
     # Metrics controls
     parser.add_argument('--compute-hd', action='store_true', help='Compute Hausdorff/HD95 metrics during validation (can be slow)')
     parser.add_argument('--auc-max-pixels', type=int, default=200000, help='Max pixels sampled for AUC computation during validation; set 0 to disable AUC')
+    # Resume training support
+    parser.add_argument('--resume', type=str, default='', help="Path to checkpoint to resume from, or 'auto' to load saved/models/last.pt if present (fallback to best.pt)")
     args = parser.parse_args()
+    # Apply fast-mode backend toggles
+    if getattr(args, 'fast_mode', False):
+        try:
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            torch.backends.cudnn.benchmark = True
+            torch.backends.cudnn.deterministic = False
+            print("[Perf] Fast mode: TF32 enabled, cudnn.benchmark on, deterministic off")
+        except Exception as e:
+            print(f"[Perf] Failed to set fast-mode toggles: {e}")
     # Parse spectral window sizes string into list[int]
     if isinstance(args.spectral_window_sizes, str):
         try:

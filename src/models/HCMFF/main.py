@@ -87,7 +87,7 @@ class CrossModalFrequencyFusionCore(nn.Module):
             p_sp = p_sp.flatten(1, 2)
         if p_sp.size(1) != p_spec.size(1):
             p_sp = F.interpolate(p_sp.transpose(1, 2), size=p_spec.size(1), mode='linear', align_corners=False).transpose(1, 2)
-        with torch.cuda.amp.autocast(enabled=False):
+        with torch.amp.autocast('cuda', enabled=False):
             q = p_sp.to(torch.float32)
             k = p_spec.to(torch.float32)
             v = p_spec.to(torch.float32)
@@ -96,7 +96,7 @@ class CrossModalFrequencyFusionCore(nn.Module):
 
     def split_freq(self, fused_amp: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         x = fused_amp.transpose(1, 2)
-        with torch.cuda.amp.autocast(enabled=False):
+        with torch.amp.autocast('cuda', enabled=False):
             lo = self.low(x.float()).transpose(1, 2)
             hi = self.high(x.float()).transpose(1, 2)
         return lo.to(fused_amp.dtype), hi.to(fused_amp.dtype)
