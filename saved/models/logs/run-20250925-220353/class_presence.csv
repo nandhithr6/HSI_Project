@@ -1,0 +1,6 @@
+mask_key,total,train,val,test
+mask__artery,80,58,10,12
+mask__vein,83,58,12,13
+mask__suture,5,3,1,1
+mask__stroma,101,70,15,16
+mask__umbilical_cord,27,17,5,5

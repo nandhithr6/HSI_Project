@@ -37,10 +37,16 @@ class HSIModel(nn.Module):
                  spectral_stride: int = 4,
                  spectral_pixels_per_chunk: int = 8192,
                  num_classes: int = 6,
-                 verbose: bool = False):
+                 verbose: bool = False,
+                 # Compatibility with training script flags (currently bypassed inside the model)
+                 use_hcmff: bool = False,
+                 hcmff_tokens: int = 256):
         super().__init__()
         self.verbose = verbose
         self.decoder_input_dim = spatial_embed_dim
+        # Store flags for compatibility; current V2 pipeline does not route through HCMFF
+        self.use_hcmff = use_hcmff
+        self.hcmff_tokens = hcmff_tokens
 
         # --- Spatial Branch ---
         self.local_stream = LocalFeatureStream(num_bands)
@@ -79,6 +85,8 @@ class HSIModel(nn.Module):
             print(f"[Init] SpectralStream V2 ✓ (patch_size={patch_size})")
             print("[Init] TCME V2 ✓ (Simplified Fusion)")
             print(f"[Init] Decoder ✓ (num_classes={num_classes}, will be initialized dynamically)")
+            if self.use_hcmff:
+                print("[Init] Note: use_hcmff flag provided but HCMFF path is bypassed in this V2 model.")
 
 
     def _should_log(self, x: torch.Tensor) -> bool:
