@@ -440,7 +440,9 @@ def train_one_run(
         spectral_stride=args.spectral_stride,
         spectral_pixels_per_chunk=args.spectral_pixels_per_chunk,
         num_classes=num_classes_model,
-        verbose=args.verbose_model
+        verbose=args.verbose_model,
+        use_hcmff=getattr(args, 'use_hcmff', False),
+        hcmff_tokens=getattr(args, 'hcmff_tokens', 256)
     ).to(device)
 
     # Multi-GPU support
@@ -1033,7 +1035,7 @@ def main():
     parser.add_argument('--image-key', type=str, default='image')
     parser.add_argument('--mask-key', type=str, default='mask', help='Fallback single-mask key if --mask-keys is not provided')
     parser.add_argument('--mask-keys', type=str, default='mask__artery,mask__vein,mask__suture,mask__stroma,mask__stroma_icg,mask__artery_icg,mask__umbilical_cord', help='Comma-separated mask keys for multiclass; order defines class ids 1..N (0=background)')
-    parser.add_argument('--ensemble-eval', action='store-true', help='Run fold ensemble on the last fold validation set')
+    parser.add_argument('--ensemble-eval', action='store_true', help='Run fold ensemble on the last fold validation set')
     parser.add_argument('--log-dir', type=str, default='saved/models/logs', help='Directory to store logs (CSV/TensorBoard)')
     parser.add_argument('--run-name', type=str, default=None, help='Optional run name suffix for logs and checkpoints')
     parser.add_argument('--progressive-unfreeze', action='store_true', help='Enable progressive unfreezing schedule')
