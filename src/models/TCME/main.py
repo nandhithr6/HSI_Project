@@ -1,302 +1,75 @@
 """
-TCME: Token Cross-Modal Enhancer 
-A multi-scale transformer block for spatial–spectral token fusion and compression
-Author: Nandhitha  
-Date: September 2025
+TCME: Token Cross-Modal Enhancer - V2 (Simplified)
+
+This module has been completely redesigned. With both spatial and spectral streams
+now producing an equal number of patch-based tokens, the original TCME's complex
+logic for handling token imbalance is no longer necessary.
+
+This new version is much simpler and more direct:
+1.  It receives spatial and spectral tokens of the same sequence length.
+2.  It concatenates them along the sequence dimension.
+3.  It applies a standard Transformer block (self-attention + MLP) to the
+    concatenated sequence. This allows for powerful, all-to-all fusion
+    between every spatial and spectral token.
+4.  No token compression is performed, as the total number of tokens is manageable.
+
+This design is more efficient and directly fuses the information from both modalities.
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.checkpoint import checkpoint
 
-
-# -------------------------------------------------
-# Multi-Scale Token Division
-# -------------------------------------------------
-class MultiScaleDivider(nn.Module):
-    """
-    Generate multi-resolution token sets (scales = {1, 2, 4}) by average pooling.
-    - Input: tokens (B, N, D), reshaped into (H, W) grid
-    - Output: dict of scale -> downsampled tokens
-    """
-    def __init__(self, scales=(1, 2, 4)):
+class TransformerBlock(nn.Module):
+    """A standard Transformer block with Pre-Normalization."""
+    def __init__(self, dim: int, num_heads: int = 8, mlp_ratio: int = 4):
         super().__init__()
-        self.scales = scales
+        self.norm1 = nn.LayerNorm(dim)
+        self.attn = nn.MultiheadAttention(dim, num_heads, batch_first=True)
+        self.norm2 = nn.LayerNorm(dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, dim * mlp_ratio),
+            nn.GELU(),
+            nn.Linear(dim * mlp_ratio, dim),
+        )
 
-    def forward(self, tokens, H, W):
-        """
-        Args:
-            tokens: (B, N, D) where N = H*W (spectral) or N_patches (spatial)
-            H, W: spatial dimensions of the grid
-        Returns:
-            dict {scale: (B, N_scale, D)}
-        """
-        B, N, D = tokens.shape
-        out = {}
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Pre-normalization
+        x = x + self.attn(*[self.norm1(x)]*3)[0]
+        x = x + self.mlp(self.norm2(x))
+        return x
 
-        # reshape tokens back to image grid (B, D, H, W)
-        grid = tokens.view(B, H, W, D).permute(0, 3, 1, 2)
-
-        for s in self.scales:
-            if s == 1:
-                out[s] = tokens  # keep original
-            else:
-                # average pooling by factor s
-                pooled = F.avg_pool2d(grid, kernel_size=s, stride=s)
-                Hs, Ws = pooled.shape[2], pooled.shape[3]
-                # flatten back into sequence of tokens
-                out[s] = pooled.flatten(2).transpose(1, 2)  # (B, N//s^2, D)
-
-        return out
-
-
-# -------------------------------------------------
-# Attention Block (Self + Cross Modal)
-# -------------------------------------------------
-class CrossModalAttentionBlock(nn.Module):
-    """
-    Performs both:
-    - Self-attention: within spatial tokens and spectral tokens
-    - Cross-attention: spatial->spectral and spectral->spatial
-    Uses FlashAttention kernels (via scaled_dot_product_attention).
-    """
-    def __init__(self, dim, num_heads=8, use_checkpoint=False):
-        super().__init__()
-        self.num_heads = num_heads
-        self.dim = dim
-        self.use_checkpoint = use_checkpoint
-
-        # projection layers for self-attention
-        self.qkv_spatial = nn.Linear(dim, dim * 3, bias=False)
-        self.qkv_spectral = nn.Linear(dim, dim * 3, bias=False)
-
-        # projection layers for cross-attention
-        self.q_spatial = nn.Linear(dim, dim, bias=False)
-        self.kv_spectral = nn.Linear(dim, dim * 2, bias=False)
-
-        self.q_spectral = nn.Linear(dim, dim, bias=False)
-        self.kv_spatial = nn.Linear(dim, dim * 2, bias=False)
-
-        self.out_proj = nn.Linear(dim, dim)
-
-    def _flash_attention(self, q, k, v):
-        """
-        Wrapper for PyTorch 2.5+ scaled_dot_product_attention,
-        which automatically uses FlashAttention kernels on GPU.
-        """
-        return F.scaled_dot_product_attention(q, k, v)
-
-    def forward_fn(self, Tspatial, Tspectral):
-        """
-        Args:
-            Tspatial: (B, N1, D)  spatial tokens
-            Tspectral: (B, N2, D) spectral tokens
-        Returns:
-            SA_spatial, SA_spectral, CA_s2sp, CA_sp2s
-        """
-        B, N1, D = Tspatial.shape
-        _, N2, _ = Tspectral.shape
-
-        # --- Self-Attention (spatial)
-        qkv = self.qkv_spatial(Tspatial).reshape(B, N1, 3, self.num_heads, D // self.num_heads)
-        q, k, v = qkv.unbind(2)
-        SA_spatial = self._flash_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2))
-        SA_spatial = SA_spatial.transpose(1, 2).reshape(B, N1, D)
-
-        # --- Self-Attention (spectral)
-        qkv = self.qkv_spectral(Tspectral).reshape(B, N2, 3, self.num_heads, D // self.num_heads)
-        q, k, v = qkv.unbind(2)
-        SA_spectral = self._flash_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2))
-        SA_spectral = SA_spectral.transpose(1, 2).reshape(B, N2, D)
-
-        # --- Cross Attention Spatial -> Spectral
-        q = self.q_spatial(Tspatial).reshape(B, N1, self.num_heads, D // self.num_heads).transpose(1, 2)
-        kv = self.kv_spectral(Tspectral).reshape(B, N2, 2, self.num_heads, D // self.num_heads)
-        k, v = kv[:, :, 0], kv[:, :, 1]
-        k, v = k.transpose(1, 2), v.transpose(1, 2)
-        CA_s2sp = self._flash_attention(q, k, v).transpose(1, 2).reshape(B, N1, D)
-
-        # --- Cross Attention Spectral -> Spatial
-        q = self.q_spectral(Tspectral).reshape(B, N2, self.num_heads, D // self.num_heads).transpose(1, 2)
-        kv = self.kv_spatial(Tspatial).reshape(B, N1, 2, self.num_heads, D // self.num_heads)
-        k, v = kv[:, :, 0], kv[:, :, 1]
-        k, v = k.transpose(1, 2), v.transpose(1, 2)
-        CA_sp2s = self._flash_attention(q, k, v).transpose(1, 2).reshape(B, N2, D)
-
-        return SA_spatial, SA_spectral, CA_s2sp, CA_sp2s
-
-    def forward(self, Tspatial, Tspectral):
-        if self.use_checkpoint:
-            return checkpoint(self.forward_fn, Tspatial, Tspectral, use_reentrant=False)
-        else:
-            return self.forward_fn(Tspatial, Tspectral)
-
-
-# -------------------------------------------------
-# Token Scoring (multi-criteria)
-# -------------------------------------------------
-class TokenScorer(nn.Module):
-    """
-    Compute importance scores per token based on:
-    - Self-attention weights
-    - Cross-attention weights
-    - Value vector norms
-    Combined multiplicatively with learnable temperature parameters.
-    """
-    def __init__(self, dim):
-        super().__init__()
-        self.temperatures = nn.Parameter(torch.ones(5))  # τk params
-
-    def forward(self, SA_spatial, SA_spectral, CA_s2sp, CA_sp2s,
-                values_spatial, values_spectral):
-        """
-        Args:
-            SA_spatial: (B, N1, D)
-            SA_spectral: (B, N2, D)
-            CA_s2sp: (B, N1, D)
-            CA_sp2s: (B, N2, D)
-            values_spatial: original spatial tokens (B, N1, D)
-            values_spectral: original spectral tokens (B, N2, D)
-        Returns:
-            Score_spatial: (B, N1)
-            Score_spectral: (B, N2)
-        """
-        # attention aggregation
-        S_spatial = SA_spatial.abs().sum(dim=-1)
-        S_spectral = SA_spectral.abs().sum(dim=-1)
-        S_s2sp = CA_s2sp.abs().sum(dim=-1)
-        S_sp2s = CA_sp2s.abs().sum(dim=-1)
-
-        # value vector norm
-        Vnorm_spatial = values_spatial.norm(dim=-1)
-        Vnorm_spectral = values_spectral.norm(dim=-1)
-
-        τ = torch.clamp(self.temperatures, 0.1, 10.0)
-
-        Score_spatial = (S_spatial ** τ[0]) * (S_s2sp ** τ[2]) * (Vnorm_spatial ** τ[4])
-        Score_spectral = (S_spectral ** τ[1]) * (S_sp2s ** τ[3]) * (Vnorm_spectral ** τ[4])
-
-        return Score_spatial, Score_spectral
-
-
-# -------------------------------------------------
-# Token Compression
-# -------------------------------------------------
-class TokenCompressor(nn.Module):
-    """
-    Token compression in 2 stages:
-    - Stage 1: Pair-constrained selection (mutual attention-based)
-    - Stage 2: Top-K selection per modality
-    """
-    def __init__(self, N_pairs=5000, K_spatial=800, K_spectral=2000):
-        super().__init__()
-        self.N_pairs = N_pairs
-        self.K_spatial = K_spatial
-        self.K_spectral = K_spectral
-
-    def forward(self, Score_spatial, Score_spectral, Tspatial, Tspectral):
-        B, N1, D = Tspatial.shape
-        _, N2, _ = Tspectral.shape
-
-        # -------------------------------
-        # Stage 1: Pair-Constrained Selection
-        # -------------------------------
-        # compute affinity matrix (cosine similarity)
-        norm_sp = F.normalize(Tspatial, dim=-1)  # (B, N1, D)
-        norm_spec = F.normalize(Tspectral, dim=-1)  # (B, N2, D)
-
-        # (B, N1, N2) similarity scores
-        affinity = torch.bmm(norm_sp, norm_spec.transpose(1, 2))
-
-        # flatten to (B, N1*N2)
-        affinity_flat = affinity.view(B, -1)
-
-        # select top-N_pairs globally
-        top_pairs = torch.topk(affinity_flat, k=min(self.N_pairs, affinity_flat.size(1)), dim=1)
-        pair_indices = top_pairs.indices  # (B, N_pairs)
-
-        # convert flat indices → (i_spatial, j_spectral)
-        i_spatial = pair_indices // N2
-        j_spectral = pair_indices % N2
-
-        # gather paired tokens
-        Tspatial_pairs = torch.gather(Tspatial, 1, i_spatial.unsqueeze(-1).expand(-1, -1, D))
-        Tspectral_pairs = torch.gather(Tspectral, 1, j_spectral.unsqueeze(-1).expand(-1, -1, D))
-
-        # -------------------------------
-        # Stage 2: Top-K per modality
-        # -------------------------------
-        # recompute scores restricted to selected pairs
-        Score_spatial_sel = torch.gather(Score_spatial, 1, i_spatial)
-        Score_spectral_sel = torch.gather(Score_spectral, 1, j_spectral)
-
-        # spatial Top-K
-        topk_sp = torch.topk(Score_spatial_sel, k=min(self.K_spatial, Score_spatial_sel.size(1)), dim=1)
-        idx_sp = topk_sp.indices
-        T_spatial_sel = torch.gather(Tspatial_pairs, 1, idx_sp.unsqueeze(-1).expand(-1, -1, D))
-
-        # spectral Top-K
-        topk_spec = torch.topk(Score_spectral_sel, k=min(self.K_spectral, Score_spectral_sel.size(1)), dim=1)
-        idx_spec = topk_spec.indices
-        T_spectral_sel = torch.gather(Tspectral_pairs, 1, idx_spec.unsqueeze(-1).expand(-1, -1, D))
-
-        return T_spatial_sel, T_spectral_sel
-
-
-# -------------------------------------------------
-# Full TCME Module
-# -------------------------------------------------
 class TokenCrossModalEnhancer(nn.Module):
     """
-    End-to-end Token Cross-Modal Enhancer:
-    1. Multi-scale division of tokens
-    2. Self- and cross-attention
-    3. Token scoring
-    4. Token compression (Top-K)
+    End-to-end Token Cross-Modal Enhancer (V2).
+    Fuses two token sequences via concatenation and a Transformer block.
     """
-    def __init__(self, dim=256, num_heads=8,
-                 N_pairs=5000, K_spatial=800, K_spectral=2000,
-                 use_checkpoint=False):
+    def __init__(self, dim=256, num_heads=8, depth=1):
         super().__init__()
-        self.divider = MultiScaleDivider()
-        self.attn = CrossModalAttentionBlock(dim, num_heads, use_checkpoint)
-        self.scorer = TokenScorer(dim)
-        self.compressor = TokenCompressor(N_pairs, K_spatial, K_spectral)
-
-    def forward(self, Tspatial, Tspectral, H, W):
+        self.transformer_blocks = nn.ModuleList([
+            TransformerBlock(dim, num_heads) for _ in range(depth)
+        ])
+        
+    def forward(self, Tspatial: torch.Tensor, Tspectral: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            Tspatial: (B, Np, D) patch tokens
-            Tspectral: (B, H*W, D) pixel tokens
-            H, W: spatial dimensions (pixels)
+            Tspatial: (B, N, D) patch tokens from the spatial stream.
+            Tspectral: (B, N, D) patch tokens from the spectral stream.
+                       (Note: N must be the same for both).
         Returns:
-            Compressed tokens:
-              - Spatial: (B, K_spatial, D)
-              - Spectral: (B, K_spectral, D)
+            Fused tokens: (B, 2*N, D)
         """
-        # Multi-scale division (only scale=1 used for now)
-        # infer grid size from number of spatial tokens
-        B, Np, D = Tspatial.shape
-        H_patch = int((Np) ** 0.5)   # assume square patch grid
-        W_patch = H_patch
+        if Tspatial.shape[1] != Tspectral.shape[1]:
+            raise ValueError(
+                f"Spatial and Spectral token counts must match for this TCME version. "
+                f"Got {Tspatial.shape[1]} and {Tspectral.shape[1]}."
+            )
 
-        spatial_scales = self.divider(Tspatial, H_patch, W_patch)
-        spectral_scales = self.divider(Tspectral, H, W)
+        # 1. Concatenate tokens along the sequence dimension
+        fused_tokens = torch.cat([Tspatial, Tspectral], dim=1)
 
-        # Cross-modal attention at fine scale
-        SA_spatial, SA_spectral, CA_s2sp, CA_sp2s = self.attn(spatial_scales[1], spectral_scales[1])
+        # 2. Apply Transformer blocks for fusion
+        for block in self.transformer_blocks:
+            fused_tokens = block(fused_tokens)
 
-        # Token importance scores
-        Score_spatial, Score_spectral = self.scorer(
-            SA_spatial, SA_spectral, CA_s2sp, CA_sp2s,
-            spatial_scales[1], spectral_scales[1]
-        )
-
-        # Token compression
-        T_spatial_sel, T_spectral_sel = self.compressor(
-            Score_spatial, Score_spectral,
-            spatial_scales[1], spectral_scales[1]
-        )
-
-        return T_spatial_sel, T_spectral_sel
+        return fused_tokens

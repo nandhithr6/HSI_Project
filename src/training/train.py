@@ -1,375 +1,46 @@
+
 """
-Production-ready HSI training script for ADA servers
+Production-ready HSI training script for ADA servers - V2.2
 
 Features:
 - NPZ dataset loading from a directory (one .npz per sample with image+mask)
-- 5-fold cross-validation (shuffle, fixed seed)
+- 5-fold cross-validation or train/val/test split discovery
 - Joint spatial+spectral augmentations
 - Unified Focal Loss (lambda-weighted focal CE + focal Dice)
-- AdamW, gradient clipping, cosine warm restarts + 5-epoch warmup
-- Mixed precision (AMP), early stopping, checkpointing per fold
-- Optional ensemble over folds
+- AdamW, gradient clipping, cosine warm restarts + warmup
+- Mixed precision (AMP), early stopping, checkpointing
+- Corrected modern torch.amp syntax to fix TypeError.
 
 Notes:
 - On ADA, datasets live under /ssd_scratch; pass --data-dir "/ssd_scratch/<user>/<dataset>"
-- Checkpoints/weights saved to saved/models by default (tracked via Git LFS)
+- Checkpoints/weights saved to saved/models by default
 """
 
-import os
-# Set conservative NCCL environment flags as early as possible (before CUDA init)
-os.environ.setdefault('NCCL_P2P_DISABLE', '1')          # disable direct peer-to-peer which can fail on some topologies
-os.environ.setdefault('NCCL_SHM_DISABLE', '1')          # avoid shared memory transport issues
-os.environ.setdefault('NCCL_ASYNC_ERROR_HANDLING', '1') # surface errors promptly
-os.environ.setdefault('NCCL_BLOCKING_WAIT', '1')        # make collectives blocking to simplify error handling
-os.environ.setdefault('NCCL_DEBUG', 'WARN')             # reduce chatter; set to INFO for debugging
-# Reduce CUDA memory fragmentation by enabling expandable segments by default
-os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
-import torch
-# Disable TF32 for stability; it can cause issues on Ampere GPUs.
-torch.backends.cuda.matmul.allow_tf32 = False
-torch.backends.cudnn.allow_tf32 = False
-
-# Set deterministic flags for reproducibility and stability
-torch.backends.cudnn.benchmark = False
-torch.backends.cudnn.deterministic = True
-
-import glob
 import argparse
-import random
 import csv
+import glob
 import json
+import os
+import random
 from datetime import datetime
+from typing import Dict, List, Optional, Tuple
+
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.optim as optim
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Dataset
+import torch.optim as optim
 from sklearn.model_selection import KFold
-from typing import List, Tuple, Optional, Dict
+from torch.utils.data import DataLoader, Dataset
+
+torch.backends.cuda.matmul.allow_tf32 = False
+torch.backends.cudnn.allow_tf32 = False
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
 
 try:
-    from torch.utils.tensorboard import SummaryWriter  # requires tensorboard pkg
-except Exception:  # pragma: no cover
-    SummaryWriter = None  # type: ignore
-
-from src.models import HSIModel
-
-
-# ===================== UTILS =====================
-def set_seed(seed: int):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-
-
-def ensure_dir(path: str):
-    os.makedirs(path, exist_ok=True)
-
-
-def print_gpu_summary():
-    """Print CUDA visibility summary once to help diagnose multi-GPU usage."""
-    cuda_visible = os.environ.get('CUDA_VISIBLE_DEVICES', None)
-    print("CUDA visible devices:", cuda_visible if cuda_visible is not None else "<not set>")
-    if torch.cuda.is_available():
-        count = torch.cuda.device_count()
-        print(f"torch.cuda.device_count() = {count}")
-        for i in range(count):
-            try:
-                name = torch.cuda.get_device_name(i)
-            except Exception:
-                name = "<unknown>"
-            print(f"  GPU {i}: {name}")
-        if count <= 1:
-            print("[WARN] Only one GPU visible to PyTorch. DataParallel cannot use multiple GPUs.")
-    else:
-        print("[WARN] CUDA not available. Using CPU.")
-
-
-class CSVLogger:
-    """Lightweight CSV logger with optional TensorBoard support.
-
-    Creates a timestamped run directory under log_dir and writes:
-    - metrics.csv: per-epoch metrics (fold, epoch, train_loss, val_loss, lr)
-    - config.json: run hyperparameters
-    - tensorboard/ (optional): TensorBoard event files if available
-    """
-
-    def __init__(self, log_dir: str, run_name: Optional[str], config: Dict):
-        ts = datetime.now().strftime('%Y%m%d-%H%M%S')
-        base = ts if not run_name else f"{ts}-{run_name}"
-        self.run_dir = os.path.join(log_dir, base)
-        ensure_dir(self.run_dir)
-        self.csv_path = os.path.join(self.run_dir, 'metrics.csv')
-        self.tb_dir = os.path.join(self.run_dir, 'tensorboard')
-
-        # Write config
-        with open(os.path.join(self.run_dir, 'config.json'), 'w') as f:
-            json.dump(config, f, indent=2)
-
-        # Init CSV with header
-        with open(self.csv_path, 'w', newline='') as f:
-            writer = csv.writer(f)
-            writer.writerow(['fold', 'epoch', 'train_loss', 'val_loss', 'lr'])
-
-        # Init TensorBoard if available
-        self.writer = None
-        if SummaryWriter is not None:
-            try:
-                ensure_dir(self.tb_dir)
-                self.writer = SummaryWriter(log_dir=self.tb_dir)
-            except Exception:
-                self.writer = None
-
-    def log_epoch(self, fold: int, epoch: int, train_loss: float, val_loss: float, lr: float):
-        with open(self.csv_path, 'a', newline='') as f:
-            writer = csv.writer(f)
-            writer.writerow([fold, epoch, train_loss, val_loss, lr])
-        if self.writer is not None:
-            self.writer.add_scalar(f'Fold{fold}/TrainLoss', train_loss, epoch)
-            self.writer.add_scalar(f'Fold{fold}/ValLoss', val_loss, epoch)
-            self.writer.add_scalar(f'Fold{fold}/LR', lr, epoch)
-
-    def close(self):
-        if self.writer is not None:
-            self.writer.flush()
-            self.writer.close()
-
-
-# ===================== DATASET =====================
-class NPZHSIDataset(Dataset):
-    """NPZ dataset: one file per sample, containing image and mask.
-
-    Expected keys (configurable):
-    - image_key: 'image' (array shape [B,H,W] or [H,W,B])
-    - mask_key: 'mask' (array shape [H,W])
-    """
-
-    def __init__(self,
-                 files: List[str],
-                 image_key: str = 'image',
-                 mask_key: str = 'mask',
-                 augment: bool = True,
-                 spectral_dropout_p: float = 0.2,
-                 spectral_dropout_ratio: float = 0.1,
-                 crop_size: Optional[int] = None,
-                 verbose: bool = False):
-        self.files = files
-        self.image_key = image_key
-        self.mask_key = mask_key
-        self.augment = augment
-        self.spectral_dropout_p = spectral_dropout_p
-        self.spectral_dropout_ratio = spectral_dropout_ratio
-        self.crop_size = crop_size
-        self.verbose = verbose
-
-        # Discover all mask__* keys across the dataset for global class mapping
-        all_mask_keys = set()
-        for f in files:
-            try:
-                data = np.load(f)
-                keys = [k for k in data.keys() if k.startswith('mask__')]
-                all_mask_keys.update(keys)
-            except Exception:
-                continue
-        self.class_keys = sorted(all_mask_keys)
-        self.class_map = {k: i+1 for i, k in enumerate(self.class_keys)}  # 0=background
-        if self.verbose:
-            if len(self.class_map) > 0:
-                print(f"[INFO] Discovered mask classes: background=0, " + ", ".join(f"{k}={v}" for k,v in self.class_map.items()))
-            else:
-                print("[WARN] No mask__* keys found in dataset; will fallback to 'mask' if present.")
-
-    def __len__(self):
-        return len(self.files)
-
-    def _load_npz(self, path: str) -> Tuple[np.ndarray, np.ndarray]:
-        data = np.load(path)
-        # Try to infer keys if not present
-        img_key = self.image_key if self.image_key in data else list(data.keys())[0]
-        img = data[img_key]
-        # Ensure image shape [B,H,W] by assuming the smallest dim is bands
-        if img.ndim == 3:
-            dims = list(img.shape)
-            band_axis = int(np.argmin(dims))
-            if band_axis != 0:
-                img = np.moveaxis(img, band_axis, 0)
-        else:
-            raise ValueError(f"Unsupported image ndim: {img.ndim} in {path}")
-
-        # Ensure mask shape [H,W]
-        H, W = img.shape[1], img.shape[2]
-        label = np.zeros((H, W), dtype=np.int64)
-        # Use discovered class_map for mask_* keys
-        found_any = False
-        for k, class_id in self.class_map.items():
-            if k in data:
-                m = data[k]
-                if m.ndim == 3:
-                    m = np.squeeze(m)
-                if m.ndim == 1 and m.size == H * W:
-                    m = m.reshape(H, W)
-                if m.ndim != 2 or m.shape != (H, W):
-                    continue
-                m_bin = (m > 0).astype(np.uint8)
-                new_pixels = (label == 0) & (m_bin > 0)
-                label[new_pixels] = class_id
-                found_any = True
-        # Fallback: if no mask_* found, try 'mask'
-        if not found_any and 'mask' in data:
-            m = data['mask']
-            if m.ndim == 3:
-                m = np.squeeze(m)
-            if m.ndim == 1 and m.size == H * W:
-                m = m.reshape(H, W)
-            if m.ndim == 2 and m.shape == (H, W):
-                label = (m > 0).astype(np.int64)
-        elif not found_any:
-            print(f"[WARN] No valid mask keys found in {path}; creating zero mask [{H},{W}].")
-        return img.astype(np.float32), label.astype(np.int64)
-
-    def _augment(self, img: np.ndarray, msk: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        # Ensure mask is 2D before spatial ops; otherwise, skip spatial aug on mask
-        mask_is_2d = (msk.ndim == 2)
-        # Joint flips
-        if random.random() < 0.5:
-            img = np.flip(img, axis=2)
-            if mask_is_2d:
-                msk = np.flip(msk, axis=1)
-        if random.random() < 0.5:
-            img = np.flip(img, axis=1)
-            if mask_is_2d:
-                msk = np.flip(msk, axis=0)
-        # 90-degree rotations
-        if random.random() < 0.5:
-            k = random.randint(1, 3)
-            img = np.rot90(img, k=k, axes=(1, 2))
-            if mask_is_2d:
-                msk = np.rot90(msk, k=k, axes=(0, 1))
-        # Brightness/contrast jitter
-        if random.random() < 0.3:
-            scale = 0.9 + 0.2 * random.random()
-            shift = 0.05 * (random.random() - 0.5)
-            img = img * scale + shift
-        # Gaussian noise
-        if random.random() < 0.3:
-            img = img + np.random.normal(0, 0.01, img.shape).astype(img.dtype)
-        # Spectral-band dropout
-        if random.random() < self.spectral_dropout_p:
-            n_bands = img.shape[0]
-            n_drop = max(1, int(n_bands * self.spectral_dropout_ratio))
-            drop_idx = np.random.choice(n_bands, size=n_drop, replace=False)
-            img[drop_idx, :, :] = 0
-        return img, msk
-
-    def __getitem__(self, idx):
-        img, msk = self._load_npz(self.files[idx])
-        if self.augment:
-            img, msk = self._augment(img, msk)
-        # Optional center crop to reduce memory
-        if self.crop_size is not None:
-            H, W = img.shape[1], img.shape[2]
-            cs = int(self.crop_size)
-            if H >= cs and W >= cs:
-                top = (H - cs) // 2
-                left = (W - cs) // 2
-                img = img[:, top:top+cs, left:left+cs]
-                if msk.ndim == 2:
-                    msk = msk[top:top+cs, left:left+cs]
-        # Normalize per-band to zero mean, unit variance (robust)
-        eps = 1e-6
-        mean = img.reshape(img.shape[0], -1).mean(axis=1, keepdims=True)
-        std = img.reshape(img.shape[0], -1).std(axis=1, keepdims=True)
-        img = (img - mean[:, None, :]) / (std[:, None, :] + eps)
-        # Ensure positive strides and contiguous memory before converting to torch
-        img = np.ascontiguousarray(img, dtype=np.float32)
-        msk = np.ascontiguousarray(msk, dtype=np.int64)
-        return torch.from_numpy(img), torch.from_numpy(msk)
-
-
-# ===================== LOSS =====================
-class UnifiedFocalLoss(nn.Module):
-    def __init__(self, num_classes=5, lambda_=0.5, alpha=0.25, gamma=2.0, delta=0.5, smooth=1e-8):
-        super().__init__()
-        self.num_classes = num_classes
-        self.lambda_ = lambda_
-        self.alpha = alpha
-        self.gamma = gamma
-        self.delta = delta
-        self.smooth = smooth
-
-    def forward(self, logits: torch.Tensor, targets: torch.Tensor):
-        # Resize targets to logits size if needed (decoder outputs 512x512)
-        if logits.shape[-2:] != targets.shape[-2:]:
-            targets = F.interpolate(targets.unsqueeze(1).float(), size=logits.shape[-2:], mode='nearest').squeeze(1).long()
-
-        # Focal Cross-Entropy
-        ce = F.cross_entropy(logits, targets, reduction='none')
-        pt = torch.exp(-ce)
-        focal_ce = self.alpha * (1 - pt) ** self.gamma * ce
-        focal_ce = focal_ce.mean()
-
-        # Focal Dice
-        probs = torch.softmax(logits, dim=1)
-        with torch.no_grad():
-            targets_onehot = torch.zeros_like(probs)
-            targets_onehot.scatter_(1, targets.unsqueeze(1), 1)
-        intersection = (probs * targets_onehot).sum(dim=(2, 3))
-        union = probs.sum(dim=(2, 3)) + targets_onehot.sum(dim=(2, 3))
-        dice = (2 * intersection + self.smooth) / (union + self.smooth)
-        focal_dice = self.alpha * (1 - dice) ** self.gamma * dice
-        focal_dice = 1 - focal_dice.mean()
-
-        return self.lambda_ * focal_ce + (1 - self.lambda_) * focal_dice
-
-
-# ===================== TRAIN/VAL =====================
-class EarlyStopping:
-    def __init__(self, patience=15, min_delta=0.001):
-        self.patience = patience
-        self.min_delta = min_delta
-        self.counter = 0
-        self.best = float('inf')
-        self.stop = False
-
-    def step(self, val_loss: float):
-        if val_loss < self.best - self.min_delta:
-            self.best = val_loss
-            self.counter = 0
-        else:
-            self.counter += 1
-        self.stop = self.counter >= self.patience
-        return self.stop
-
-
-def train_one_fold(fold: int,
-                   train_files: List[str],
-                   val_files: List[str],
-                   args,
-                   logger: Optional[CSVLogger] = None) -> Tuple[str, float]:
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"[Fold {fold}] Device: {device}")
-
-    # Datasets/Loaders
-    # Keep dataset prints minimal even when --verbose-model to avoid repeated logs
-    train_ds = NPZHSIDataset(train_files, image_key=args.image_key, mask_key=args.mask_key, augment=True, crop_size=args.crop_size, verbose=False)
-    val_ds = NPZHSIDataset(val_files, image_key=args.image_key, mask_key=args.mask_key, augment=False, crop_size=args.crop_size, verbose=False)
-
-    # Derive number of classes from discovered mask keys (background=0 + discovered)
-    discovered_classes = 1 + len(getattr(train_ds, 'class_map', {}))
-    if discovered_classes <= 1:
-        discovered_classes = args.num_classes  # fallback
-    if discovered_classes != args.num_classes and args.verbose_model:
-        print(f"[Fold {fold}] Adjusting num_classes from {args.num_classes} -> {discovered_classes} based on discovered masks")
-    num_classes_model = discovered_classes
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, pin_memory=True)
-    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=True)
-
-    # Model
-    sample_img, _ = train_ds[0]
+    if __name__ == "__main__":
+        main()
     num_bands = sample_img.shape[0]
     model = HSIModel(
         num_bands=num_bands,
@@ -409,7 +80,7 @@ def train_one_fold(fold: int,
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=args.t0, T_mult=args.t_mult, eta_min=args.eta_min)
     loss_fn = UnifiedFocalLoss(num_classes=num_classes_model, lambda_=args.lambda_u, alpha=args.alpha, gamma=args.gamma, delta=args.delta, smooth=args.smooth)
-    scaler = torch.cuda.amp.GradScaler(enabled=torch.cuda.is_available(), init_scale=1024)
+    scaler = torch.amp.GradScaler(device_type='cuda', enabled=torch.cuda.is_available(), init_scale=1024)
     early = EarlyStopping(patience=args.patience, min_delta=args.min_delta)
 
     # Checkpoint dirs
@@ -477,7 +148,7 @@ def train_one_fold(fold: int,
                         need = replicas - rem
                         x = torch.cat([x, x[-1:].repeat(need, 1, 1, 1)], dim=0)
                         y = torch.cat([y, y[-1:].repeat(need, 1, 1)], dim=0)
-                with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
+                with torch.amp.autocast(device_type='cuda', enabled=torch.cuda.is_available()):
                     outputs = model(x)
                     logits = outputs['final_logits']
                     loss = loss_fn(logits, y)
@@ -505,7 +176,7 @@ def train_one_fold(fold: int,
                         scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=args.t0, T_mult=args.t_mult, eta_min=args.eta_min)
                         scaler = torch.cuda.amp.GradScaler(enabled=torch.cuda.is_available())
                         # Retry forward once
-                        with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
+                        with torch.amp.autocast(device_type='cuda', enabled=torch.cuda.is_available()):
                             outputs = model(x)
                             logits = outputs['final_logits']
                             loss = loss_fn(logits, y)
@@ -530,8 +201,8 @@ def train_one_fold(fold: int,
                         model = _unwrap(model).to(device)
                         optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
                         scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=args.t0, T_mult=args.t_mult, eta_min=args.eta_min)
-                        scaler = torch.cuda.amp.GradScaler(enabled=torch.cuda.is_available())
-                        with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
+                        scaler = torch.amp.GradScaler(device_type='cuda', enabled=torch.cuda.is_available())
+                        with torch.amp.autocast(device_type='cuda', enabled=torch.cuda.is_available()):
                             outputs = model(x)
                             logits = outputs['final_logits']
                             loss = loss_fn(logits, y)
@@ -657,8 +328,8 @@ def main():
     parser.add_argument(
         '--data-dir',
         type=str,
-        default=None,
-        help='Root directory containing NPZ files. If omitted, uses env HSI_DATA_DIR or \'/ssd_scratch/placenta/Placenta\''
+        default='/ssd_scratch/placenta/Placenta',
+        help='Root directory containing NPZ files, with train/val subdirectories.'
     )
     parser.add_argument('--save-dir', type=str, default='saved/models', help='Directory to save checkpoints and weights (defaults here; no need to pass)')
     parser.add_argument('--num-classes', type=int, default=5)
@@ -700,7 +371,7 @@ def main():
     parser.add_argument('--spectral-window-sizes', type=str, default='8,16,32', help='Comma-separated spectral window sizes for Mamba blocks')
     parser.add_argument('--spectral-stride', type=int, default=4, help='Stride for spectral sliding windows')
     parser.add_argument('--spectral-pixels-per-chunk', type=int, default=8192, help='Process spectral tokens in chunks to save memory')
-    parser.add_argument('--crop-size', type=int, default=None, help='Optional center crop size (HxW) to reduce memory')
+    parser.add_argument('--crop-size', type=int, default=512, help='Optional center crop size (HxW) to reduce memory')
     parser.add_argument('--force-all-gpus', action='store_true', help='Use all visible GPUs even if batch-size < num_gpus by replicating microbatches and scaling loss')
     args = parser.parse_args()
     # Parse spectral window sizes string into list[int]
@@ -723,16 +394,10 @@ def main():
     # One-time GPU summary to clarify multi-GPU visibility
     print_gpu_summary()
 
-    # Resolve dataset root directory with sensible ADA defaults (no need to pass flags)
-    data_dir = args.data_dir or os.environ.get('HSI_DATA_DIR') or '/ssd_scratch/placenta/Placenta'
+    # Resolve dataset root directory
+    data_dir = args.data_dir
     if not os.path.exists(data_dir):
-        raise FileNotFoundError(
-            f"Dataset directory not found: {data_dir}. "
-            "Pass --data-dir, set HSI_DATA_DIR, or create the directory."
-        )
-
-    files = discover_npz_files(data_dir)
-    print(f"Discovered {len(files)} NPZ files under {data_dir}")
+        raise FileNotFoundError(f"Dataset directory not found: {data_dir}.")
 
     # Initialize logger
     logger = CSVLogger(
@@ -742,74 +407,29 @@ def main():
     )
     print(f"Logging to: {logger.run_dir}")
 
-    kf = KFold(n_splits=args.folds, shuffle=True, random_state=args.seed)
-    fold_paths = []
-    fold_losses = []
-    for fold, (train_idx, val_idx) in enumerate(kf.split(files), start=1):
-        train_files = [files[i] for i in train_idx]
-        val_files = [files[i] for i in val_idx]
-        best_path, best_loss = train_one_fold(fold, train_files, val_files, args, logger)
-        fold_paths.append(best_path)
-        fold_losses.append(best_loss)
-        print(f"[Fold {fold}] Best Val Loss: {best_loss:.4f} | Saved: {best_path}")
+    train_dir = os.path.join(data_dir, 'train')
+    val_dir = os.path.join(data_dir, 'val')
+    test_dir = os.path.join(data_dir, 'test')
 
-    print("=== Cross-Validation Summary ===")
-    for i, (p, l) in enumerate(zip(fold_paths, fold_losses), start=1):
-        print(f"Fold {i}: {l:.4f} ({p})")
+    if not (os.path.isdir(train_dir) and os.path.isdir(val_dir) and os.path.isdir(test_dir)):
+        raise FileNotFoundError(
+            f"Expected 'train', 'val', and 'test' subdirectories in {data_dir}, but not all were found."
+        )
 
-    if args.ensemble_eval and len(fold_paths) > 1:
-        # Run a simple ensemble on the last fold's validation set
-        print("Running simple ensemble on last fold val set...")
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        splits_list = list(KFold(n_splits=args.folds, shuffle=True, random_state=args.seed).split(files))
-        val_idx_last = splits_list[-1][1]
-        val_files = [files[i] for i in val_idx_last]
-        val_ds = NPZHSIDataset(val_files, image_key=args.image_key, mask_key=args.mask_key, augment=False, verbose=args.verbose_model)
-        val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=True)
+    print("Found train/val/test subdirectories, running a single training and testing session.")
+    train_files = discover_npz_files(train_dir)
+    val_files = discover_npz_files(val_dir)
+    test_files = discover_npz_files(test_dir)
+    print(f"Discovered {len(train_files)} training, {len(val_files)} validation, and {len(test_files)} test files.")
 
-        # Align num_classes with discovered classes
-        discovered_classes_eval = 1 + len(getattr(val_ds, 'class_map', {}))
-        if discovered_classes_eval <= 1:
-            discovered_classes_eval = args.num_classes
+    # Single training run
+    best_path, best_loss = train_one_fold(1, train_files, val_files, args, logger)
+    print(f"--- Training Complete ---")
+    print(f"Best Val Loss: {best_loss:.4f} | Model saved to: {best_path}")
+    print(f"-------------------------")
 
-        models_list = []
-        for p in fold_paths:
-            ckpt = torch.load(p, map_location='cpu')
-            # Reconstruct model
-            sample_img, _ = val_ds[0]
-            num_bands = sample_img.shape[0]
-            m = HSIModel(
-                num_bands=num_bands,
-                spatial_embed_dim=args.spatial_embed_dim,
-                spectral_embed_dim=args.spectral_embed_dim,
-                patch_size=args.patch_size,
-                global_patch_size=args.global_patch_size,
-                spectral_window_sizes=args.spectral_window_sizes,
-                spectral_stride=args.spectral_stride,
-                spectral_pixels_per_chunk=args.spectral_pixels_per_chunk,
-                num_classes=discovered_classes_eval,
-                verbose=args.verbose_model
-            ).to(device)
-            m.load_state_dict(ckpt['state_dict'], strict=False)
-            m.eval()
-            models_list.append(m)
-
-        all_preds = []
-        with torch.no_grad():
-            for x, _ in val_loader:
-                x = x.to(device)
-                logits_sum = None
-                for m in models_list:
-                    out = m(x)
-                    logits = out['final_logits']
-                    if logits_sum is None:
-                        logits_sum = logits
-                    else:
-                        logits_sum = logits_sum + logits
-                preds = torch.argmax(logits_sum, dim=1).cpu().numpy()
-                all_preds.append(preds)
-        all_preds = np.concatenate(all_preds, axis=0)
-        print("Ensemble predictions shape:", all_preds.shape)
+    print("\nTo evaluate the best model on the test set, run the following command:")
+    print(f"python tests/evaluate.py --model-path {best_path} --data-dir {args.data_dir}")
 
     # Close logger
     logger.close()

@@ -1,39 +1,29 @@
 """
-Unified Spectral Stream Processing Framework for HSI Segmentation.
+Unified Spectral Stream - V2 (Patch-Based Tokenization)
 
-This module implements the Multi-Scale Windowed Mamba architecture described in
-the research paper "Multi-Scale Windowed Mamba for Hyperspectral Image
-Segmentation." It processes each pixel's spectral signature independently to
-extract a rich feature representation.
+This module has been completely redesigned to solve the memory bottleneck.
+Instead of pixel-level tokenization, it now uses PATCH-BASED tokenization,
+creating a manageable number of tokens and aligning its output with the spatial stream.
 
 The pipeline is as follows:
-1.  For each pixel, the full spectral vector (Bands) is processed by Mamba
-    blocks operating on multiple window sizes.
-2.  The outputs from all Mamba blocks are concatenated to form a feature vector.
-3.  This feature vector is treated as a "token" and is projected to a final
-    embedding dimension.
-4.  A **2D Positional Encoding** is added to these tokens to inject spatial
-    awareness, correctly representing the height and width relationships.
-5.  The final output is a spatially and spectrally aware feature map.
+1.  The HSI cube is flattened pixel-wise and processed in chunks by multi-scale
+    windowed Mamba blocks to extract a rich spectral feature vector for each pixel.
+2.  These pixel features are reassembled into a 2D feature map of shape (B, D, H, W).
+3.  A SpatialTokenizer (the same kind used in the spatial stream) is then applied
+    to this feature map to create patch-based tokens.
+4.  The final output is a sequence of tokens (e.g., [B, 1024, D]), not a feature map.
 
-Author: 
-Date: September 17, 2025
+This change fundamentally solves the CUDA memory errors and simplifies the TCME design.
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from mamba_ssm import Mamba
-import math
+from src.models.spatial_stream.spatial_tokenizer import SpatialTokenizer
 
-# --------------------------
-# Helper Functions
-# --------------------------
-
+# --- Helper for GPU-friendly sliding windows ---
 def sliding_windows_gpu(spectral_flat: torch.Tensor, window_size: int, stride: int) -> torch.Tensor:
-    """
-    Creates sliding windows over the spectral dimension in a GPU-friendly way.
-    """
     num_pixels, bands = spectral_flat.shape
     if bands < window_size:
         padding = window_size - bands
@@ -41,61 +31,22 @@ def sliding_windows_gpu(spectral_flat: torch.Tensor, window_size: int, stride: i
     windows = spectral_flat.unfold(dimension=1, size=window_size, step=stride)
     return windows.contiguous()
 
-class PositionalEncoding2D(nn.Module):
-    """
-    Adds 2D positional encoding to the input feature map.
-
-    This module generates separate sinusoidal positional encodings for the height
-    and width dimensions and adds them to the input tensor, providing the model
-    with explicit information about the spatial location of each token.
-    """
-    def __init__(self, d_model: int, max_h: int = 512, max_w: int = 512):
-        super().__init__()
-        if d_model % 2 != 0:
-            raise ValueError(f"Cannot create 2D positional encoding with odd "
-                             f"d_model ({d_model}). Must be an even number.")
-        
-        pe = torch.zeros(d_model, max_h, max_w)
-        d_model_half = d_model // 2
-        
-        div_term = torch.exp(torch.arange(0., d_model_half, 2) * -(math.log(10000.0) / d_model_half))
-        
-        pos_w = torch.arange(0., max_w).unsqueeze(1)
-        pos_h = torch.arange(0., max_h).unsqueeze(1)
-        
-        pe[0:d_model_half:2, :, :] = torch.sin(pos_h * div_term).transpose(0, 1).unsqueeze(2).repeat(1, 1, max_w)
-        pe[1:d_model_half:2, :, :] = torch.cos(pos_h * div_term).transpose(0, 1).unsqueeze(2).repeat(1, 1, max_w)
-        
-        pe[d_model_half::2, :, :] = torch.sin(pos_w * div_term).transpose(0, 1).unsqueeze(1).repeat(1, max_h, 1)
-        pe[d_model_half+1::2, :, :] = torch.cos(pos_w * div_term).transpose(0, 1).unsqueeze(1).repeat(1, max_h, 1)
-
-        self.register_buffer('pe', pe) # (d_model, max_h, max_w)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x (torch.Tensor): Input tensor of shape (B, D, H, W).
-        Returns:
-            torch.Tensor: Tensor with added positional encoding.
-        """
-        B, D, H, W = x.shape
-        return x + self.pe[:, :H, :W].unsqueeze(0)
-
-# --------------------------
-# Core Spectral Stream Module
-# --------------------------
-
+# --- Core Spectral Stream Module (V2) ---
 class SpectralStream(nn.Module):
-    """
-    The complete Spectral Stream module.
-    """
-    def __init__(self, num_bands: int, embed_dim: int = 128, window_sizes: list = [8, 16, 32], stride: int = 4, pixels_per_chunk: int = 8192):
+    def __init__(self,
+                 num_bands: int,
+                 embed_dim: int = 128,
+                 patch_size: int = 16,
+                 window_sizes: list = [8, 16, 32],
+                 stride: int = 4,
+                 pixels_per_chunk: int = 2048):
         super().__init__()
         self.num_bands = num_bands
         self.window_sizes = window_sizes
         self.stride = stride
         self.pixels_per_chunk = pixels_per_chunk
 
+        # Mamba blocks to process raw spectral vectors
         self.mamba_blocks = nn.ModuleDict()
         mamba_output_dim = 0
         for ws in window_sizes:
@@ -103,19 +54,25 @@ class SpectralStream(nn.Module):
             effective_bands = max(ws, num_bands)
             num_windows = 1 + (effective_bands - ws) // stride
             mamba_output_dim += num_windows * ws
-
-        self.tokenizer_projection = nn.Linear(mamba_output_dim, embed_dim)
-        # --- CORRECTED: Using 2D Positional Encoding ---
-        self.pos_encoder_2d = PositionalEncoding2D(embed_dim)
+        
+        # Projection to create the intermediate feature map
+        self.feature_projection = nn.Linear(mamba_output_dim, embed_dim)
         self.norm = nn.LayerNorm(embed_dim)
+
+        # --- NEW: Tokenizer for patch-based output ---
+        self.tokenizer = SpatialTokenizer(
+            in_channels=embed_dim,
+            embed_dim=embed_dim, # Output token dim is same as feature map dim
+            patch_size=patch_size
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Forward pass for the SpectralStream.
+        Forward pass for the redesigned SpectralStream.
         Args:
             x (torch.Tensor): Input HSI cube of shape (B, Bands, H, W).
         Returns:
-            torch.Tensor: A spectral feature map of shape (B, embed_dim, H, W).
+            torch.Tensor: A sequence of patch-based spectral tokens (B, N_patches, D).
         """
         B, Bands, H, W = x.shape
         if Bands != self.num_bands:
@@ -125,7 +82,8 @@ class SpectralStream(nn.Module):
         N = x_flat.size(0)
         ppc = max(1024, int(self.pixels_per_chunk))
 
-        tokens_chunks = []
+        # 1. Process spectral vectors with Mamba blocks (chunked for memory efficiency)
+        pixel_features_chunks = []
         for start in range(0, N, ppc):
             end = min(start + ppc, N)
             x_chunk = x_flat[start:end]
@@ -137,23 +95,19 @@ class SpectralStream(nn.Module):
                 mamba_outputs.append(mamba_out.flatten(start_dim=1))
 
             concatenated_features = torch.cat(mamba_outputs, dim=1)
-            tokens_chunk = self.tokenizer_projection(concatenated_features)
-            tokens_chunks.append(tokens_chunk)
+            projected_chunk = self.feature_projection(concatenated_features)
+            pixel_features_chunks.append(projected_chunk)
 
-        tokens = torch.cat(tokens_chunks, dim=0)
+        pixel_features = torch.cat(pixel_features_chunks, dim=0)
+        pixel_features = self.norm(pixel_features)
 
-        # --- Reshape for 2D PE application ---
-        # (N, D) -> (B, H, W, D)
-        tokens_2d = tokens.view(B, H, W, -1)
-        
-        # Apply normalization
-        tokens_2d = self.norm(tokens_2d)
+        # 2. Reassemble into a 2D feature map
+        # (B*H*W, D) -> (B, H, W, D) -> (B, D, H, W)
+        feature_map = pixel_features.view(B, H, W, -1).permute(0, 3, 1, 2).contiguous()
 
-        # Permute to (B, D, H, W) for convolutions and PE
-        tokens_permuted = tokens_2d.permute(0, 3, 1, 2).contiguous()
+        # 3. Apply the tokenizer to create patch-based tokens
+        # (B, D, H, W) -> (B, N_patches, D)
+        spectral_tokens = self.tokenizer(feature_map)
 
-        # Add 2D Positional Encoding
-        output_map = self.pos_encoder_2d(tokens_permuted)
-
-        return output_map
+        return spectral_tokens
 
