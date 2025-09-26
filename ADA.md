@@ -129,4 +129,4 @@ unzip placenta-hsi-p.zip
 
 
 train it
-python -u -m  src.training.train --data-dir /ssd_scratch/placenta/Placenta --epochs 1 --batch-size 1 --merge-icg-to-base --use-hcmff --hcmff-tokens 128 --run-name progress-demo --crop-size 512 --auc-max-pixels 50000 --force-all-gpus --very-verbose
+python -u -m  src.training.train --data-dir /ssd_scratch/placenta/Placenta --epochs 1 --batch-size 4 --merge-icg-to-base --use-hcmff --hcmff-tokens 128 --run-name progress-demo --crop-size 512 --auc-max-pixels 50000 --force-all-gpus --very-verbose

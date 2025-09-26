@@ -264,13 +264,14 @@ class UnifiedFocalLoss(nn.Module):
 
 
 class NPZDataset(Dataset):
-    def __init__(self, files: List[str], image_key: str = 'image', mask_key: Optional[str] = 'mask', mask_keys: Optional[List[str]] = None, crop_size: Optional[int] = None, return_path: bool = False, merge_aliases: Optional[Dict[str, List[str]]] = None):
+    def __init__(self, files: List[str], image_key: str = 'image', mask_key: Optional[str] = 'mask', mask_keys: Optional[List[str]] = None, crop_size: Optional[int] = None, return_path: bool = False, merge_aliases: Optional[Dict[str, List[str]]] = None, augment: bool = False):
         self.files = files
         self.image_key = image_key
         self.mask_key = mask_key
         self.mask_keys = mask_keys or []
         self.crop_size = crop_size
         self.return_path = return_path
+        self.augment = augment
         # Optional class map if using multiple mask keys
         self.class_map = {k: i+1 for i, k in enumerate(self.mask_keys)} if self.mask_keys else {}
         # Optional merge aliases: base_key -> [other_keys that should map to base_key's class id]
@@ -288,6 +289,36 @@ class NPZDataset(Dataset):
         img_c = img[..., y0:y0+ch, x0:x0+cw]
         mask_c = mask[..., y0:y0+ch, x0:x0+cw]
         return img_c, mask_c
+
+    def _apply_augmentations(self, img: np.ndarray, mask: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """Apply spatial augmentations to HSI image and mask."""
+        if not self.augment:
+            return img, mask
+            
+        # Random horizontal flip (50% chance)
+        if random.random() < 0.5:
+            img = np.flip(img, axis=-1).copy()  # Flip width dimension
+            mask = np.flip(mask, axis=-1).copy()
+        
+        # Random vertical flip (50% chance)
+        if random.random() < 0.5:
+            img = np.flip(img, axis=-2).copy()  # Flip height dimension
+            mask = np.flip(mask, axis=-2).copy()
+        
+        # Random rotation (90, 180, 270 degrees with 25% chance each)
+        if random.random() < 0.75:  # 75% chance for any rotation
+            k = random.randint(1, 3)  # 1, 2, or 3 (90, 180, 270 degrees)
+            img = np.rot90(img, k=k, axes=(-2, -1)).copy()
+            mask = np.rot90(mask, k=k, axes=(-2, -1)).copy()
+        
+        # Small random spectral perturbation (only for training, preserve spectral structure)
+        if random.random() < 0.3:  # 30% chance
+            noise_scale = 0.02 * np.std(img)  # 2% of image std
+            spectral_noise = np.random.normal(0, noise_scale, img.shape).astype(img.dtype)
+            img = img + spectral_noise
+            img = np.clip(img, 0, 1)  # Keep in [0,1] range
+        
+        return img, mask
 
     def __getitem__(self, idx: int):
         path = self.files[idx]
@@ -348,6 +379,9 @@ class NPZDataset(Dataset):
         if maxv > minv:
             img = (img - minv) / (maxv - minv)
 
+        # Apply augmentations (before cropping to preserve augmentation effects)
+        img, mask = self._apply_augmentations(img, mask)
+
         # Optional center crop
         if self.crop_size is not None and self.crop_size > 0:
             img, mask = self._center_crop(img, mask, self.crop_size)
@@ -403,6 +437,7 @@ def train_one_run(
         crop_size=args.crop_size,
         return_path=want_paths,
         merge_aliases=merge_aliases if merge_aliases else None,
+        augment=True,  # Enable augmentations for training
     )
     val_ds = NPZDataset(
         val_files,
@@ -412,6 +447,7 @@ def train_one_run(
         crop_size=args.crop_size,
         return_path=want_paths,
         merge_aliases=merge_aliases if merge_aliases else None,
+        augment=False,  # No augmentations for validation
     )
 
     def _collate_with_paths(batch):
@@ -459,6 +495,10 @@ def train_one_run(
     ).to(device)
 
     # channels_last disabled per request
+
+    # Warm up model to initialize dynamic components before DataParallel
+    if hasattr(model, 'warm_up'):
+        model.warm_up(device, input_shape=(1, num_bands, args.crop_size, args.crop_size))
 
     # Optional compile (must happen before DataParallel)
     if getattr(args, 'compile_model', False):
@@ -563,6 +603,13 @@ def train_one_run(
             ])
 
     for epoch in range(start_epoch, args.epochs):
+        # Ensure device consistency at start of each epoch
+        if hasattr(model, 'ensure_device_consistency'):
+            if isinstance(model, nn.DataParallel):
+                model.module.ensure_device_consistency(device)
+            else:
+                model.ensure_device_consistency(device)
+        
         model.train()
         if args.progressive_unfreeze:
             _m = _unwrap(model)
@@ -1146,7 +1193,7 @@ def main():
     parser.add_argument('--epochs', type=int, default=60)
     parser.add_argument('--batch-size', type=int, default=4)
     parser.add_argument('--num-workers', type=int, default=4)
-    parser.add_argument('--folds', type=int, default=5)
+    parser.add_argument('--folds', type=int, default=5, help='[UNUSED] Only kept for compatibility - script uses train/val/test split')
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--lr', type=float, default=2e-4)
     parser.add_argument('--weight-decay', type=float, default=1e-4)
@@ -1235,6 +1282,16 @@ def main():
             args.mask_keys = [k for k in args.mask_keys if k not in to_drop]
 
     set_seed(args.seed)
+    
+    # Create organized folder structure
+    # If run_name is provided, create a dedicated experiment folder
+    if args.run_name:
+        experiment_base = os.path.join(args.save_dir, args.run_name)
+        ensure_dir(experiment_base)
+        # Update paths to be within the experiment folder
+        args.save_dir = os.path.join(experiment_base, 'weights')
+        args.log_dir = os.path.join(experiment_base, 'logs')
+    
     ensure_dir(args.save_dir)
     ensure_dir(args.log_dir)
     # One-time GPU summary to clarify multi-GPU visibility
@@ -1245,13 +1302,14 @@ def main():
     if not os.path.exists(data_dir):
         raise FileNotFoundError(f"Dataset directory not found: {data_dir}.")
 
-    # Initialize logger
+    # Initialize logger (now logs will go to organized structure)
     logger = CSVLogger(
         log_dir=args.log_dir,
-        run_name=args.run_name,
+        run_name=None,  # No additional subfolder since we're already organized
         config={k: (v if isinstance(v, (int, float, str, bool, type(None))) else str(v)) for k, v in vars(args).items()}
     )
     print(f"Logging to: {logger.run_dir}")
+    print(f"Weights will be saved to: {args.save_dir}")
 
     train_dir = os.path.join(data_dir, 'train')
     val_dir = os.path.join(data_dir, 'val')

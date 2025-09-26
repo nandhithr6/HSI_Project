@@ -1,2 +1,0 @@
-epoch,acc,macro_dice,macro_iou,macro_precision,macro_recall,macro_specificity,macro_f1,macro_dice_no_bg,macro_iou_no_bg,balanced_accuracy,kappa,mcc,auc_macro,hd_mean,hd95_mean,params_million,flops_gmac,val_time_sec,gpu_mem_mb
-1,0.3299176534016927,0.08269124847888691,0.05498627556694879,0.05498627556694879,0.16666666666666666,0.8333333333333334,0.08269124847888691,0.0,0.0,0.16666666666666666,0.0,nan,nan,nan,nan,17.592088,,18.296440839767456,4731.43798828125

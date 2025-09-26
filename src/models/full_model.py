@@ -76,14 +76,20 @@ class HSIModel(nn.Module):
             self.spec_proj = nn.Linear(spectral_embed_dim, spatial_embed_dim)
         self.tcme = TokenCrossModalEnhancer(dim=spatial_embed_dim, num_heads=8)
         
+        # Decoder will be initialized dynamically on first forward pass
         self.decoder = None
+        self.decoder_initialized = False
         self.num_classes = num_classes
         self.patch_size = patch_size
         # --- Optional HCMFF path ---
         self.hcmff = None
-        self.hcmff_token_proj = None  # lazy, projects sequence length N->K for HCMFF compute control
+        self.hcmff_token_proj = None  # Projects sequence length N->K for HCMFF compute control
         if self.use_hcmff:
             self.hcmff = HierarchicalCrossModalityFrequencyFusion(feature_dim=spatial_embed_dim, verbose=verbose)
+            # Pre-initialize token projection based on expected token count
+            # Each stream (spatial/spectral) produces 1024 tokens, we compress to hcmff_tokens
+            if hcmff_tokens != 1024:  # Only create if compression is needed
+                self.hcmff_token_proj = nn.Linear(1024, hcmff_tokens)
 
         if self.verbose:
             print("[Init] Model V2: Patch-Based Architecture")
@@ -95,8 +101,59 @@ class HSIModel(nn.Module):
                 print("[Init] Note: use_hcmff flag provided but HCMFF path is bypassed in this V2 model.")
 
 
+
+
     def _should_log(self, x: torch.Tensor) -> bool:
         return self.verbose and ((x.device.type == 'cpu') or (getattr(x.device, 'index', 0) == 0))
+
+    def ensure_device_consistency(self, device):
+        """Ensure all components are on the correct device."""
+        def move_module_to_device(module, name):
+            if module is not None:
+                module.to(device)
+                print(f"[Device] Moved {name} to {device}")
+        
+        move_module_to_device(self.local_stream, "local_stream")
+        move_module_to_device(self.global_stream, "global_stream")
+        move_module_to_device(self.fusion, "fusion")
+        move_module_to_device(self.spatial_tokenizer, "spatial_tokenizer")
+        move_module_to_device(self.spectral_stream, "spectral_stream")
+        move_module_to_device(self.tcme, "tcme")
+        move_module_to_device(self.hcmff, "hcmff")
+        move_module_to_device(self.hcmff_token_proj, "hcmff_token_proj")
+        move_module_to_device(self.decoder, "decoder")
+        if hasattr(self, 'spec_proj') and self.spec_proj is not None:
+            move_module_to_device(self.spec_proj, "spec_proj")
+
+    def train(self, mode: bool = True):
+        """Override train to ensure device consistency."""
+        result = super().train(mode)
+        if mode and hasattr(self, '_last_device'):
+            # Force all components back to the correct device when switching to train mode
+            self.ensure_device_consistency(self._last_device)
+        return result
+
+    def warm_up(self, device, input_shape=(1, 224, 512, 512)):
+        """Warm up the model to initialize all dynamic components before DataParallel wrapping."""
+        self.eval()
+        with torch.no_grad():
+            # Create a dummy input on the specified device
+            dummy_input = torch.randn(*input_shape, device=device)
+            # Run forward pass to trigger dynamic initialization
+            outputs = self.forward(dummy_input)
+        
+        # Ensure everything is on the correct device after initialization
+        self.ensure_device_consistency(device)
+        self._last_device = device  # Remember the device for future consistency checks
+        
+        print(f"[Warmup] Model initialized on device {device}")
+        print(f"[Warmup] Decoder initialized: {self.decoder_initialized}")
+        if hasattr(self, 'hcmff_token_proj') and self.hcmff_token_proj is not None:
+            print(f"[Warmup] HCMFF token projection initialized: {self.hcmff_token_proj.weight.device}")
+            print(f"[Warmup] HCMFF token projection shape: {self.hcmff_token_proj.in_features}→{self.hcmff_token_proj.out_features}")
+        else:
+            print("[Warmup] HCMFF token projection: None (may be created later)")
+        return self
 
     def forward(self, x):
         B, Bands, H, W = x.shape
@@ -132,9 +189,16 @@ class HSIModel(nn.Module):
                 # tokens: (B, N, D) -> (B, D, N) -> Linear(N->K) -> (B, K, D)
                 if K is None or tokens.size(1) == K:
                     return tokens
+                
+                # CRITICAL: No dynamic layer creation allowed in forward pass for DataParallel compatibility
+                if self.hcmff_token_proj is None:
+                    raise RuntimeError(f"HCMFF token projection not initialized during warmup. Expected {tokens.size(1)}→{K}")
+                
+                # Verify the projection matches expected dimensions
                 N = tokens.size(1)
-                if (self.hcmff_token_proj is None) or (self.hcmff_token_proj.in_features != N) or (self.hcmff_token_proj.out_features != K):
-                    self.hcmff_token_proj = nn.Linear(N, K).to(tokens.device)
+                if self.hcmff_token_proj.in_features != N or self.hcmff_token_proj.out_features != K:
+                    raise RuntimeError(f"HCMFF token projection dimension mismatch: expected {N}→{K}, got {self.hcmff_token_proj.in_features}→{self.hcmff_token_proj.out_features}")
+                
                 t = tokens.transpose(1, 2)
                 t = self.hcmff_token_proj(t)
                 return t.transpose(1, 2)
@@ -159,23 +223,27 @@ class HSIModel(nn.Module):
         if self._should_log(x):
             print(f"[FWD] Fused Tokens for Decoder -> {tuple(fused_tokens.shape)}")
         
-        # --- 4. Decoder (with dynamic initialization) ---
-        if self.decoder is None:
-            # First forward pass: inspect token shape and initialize the decoder
+        # --- 4. Decoder ---
+        if not self.decoder_initialized:
+            # Only allow dynamic initialization during warmup (eval mode + no_grad)
+            if self.training:
+                raise RuntimeError("Decoder not initialized during warmup. Dynamic initialization not allowed during training for DataParallel compatibility.")
+            
+            # Initialize decoder during warmup
             num_fused_tokens = fused_tokens.shape[1]
             token_dim = fused_tokens.shape[2]
+            device = fused_tokens.device
             
             self.decoder = MSTDHSHDecoder(
                 input_token_dim=token_dim,
                 num_classes=self.num_classes,
                 num_input_tokens=num_fused_tokens
-            ).to(fused_tokens.device)
+            ).to(device)
             
+            self.decoder_initialized = True
             if self._should_log(x):
-                print("[Flow] Dynamically initialized decoder.")
-                print(f"       - Decoder expects tokens: {num_fused_tokens}")
-                print(f"       - Token Dim: {token_dim}")
-
+                print(f"[Warmup] Initialized decoder: {num_fused_tokens} tokens, dim {token_dim}, device {device}")
+        
         seg_outputs = self.decoder(fused_tokens)
         
         if self._should_log(x):
