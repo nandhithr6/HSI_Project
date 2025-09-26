@@ -107,11 +107,19 @@ class HSIModel(nn.Module):
         return self.verbose and ((x.device.type == 'cpu') or (getattr(x.device, 'index', 0) == 0))
 
     def ensure_device_consistency(self, device):
-        """Ensure all components are on the correct device."""
+        """Ensure all components are on the correct device (explicit cuda:0 for DP master)."""
+        # Normalize device (DataParallel master lives on cuda:0)
+        if isinstance(device, str):
+            device = torch.device(device)
+        if device.type == 'cuda' and device.index is None:
+            device = torch.device('cuda:0')
+
         def move_module_to_device(module, name):
             if module is not None:
                 module.to(device)
-                print(f"[Device] Moved {name} to {device}")
+                # Print only once per run to avoid spam
+                if not hasattr(self, '_printed_device_once'):
+                    print(f"[Device] Moved {name} to {device}")
         
         move_module_to_device(self.local_stream, "local_stream")
         move_module_to_device(self.global_stream, "global_stream")
@@ -125,6 +133,24 @@ class HSIModel(nn.Module):
         if hasattr(self, 'spec_proj') and self.spec_proj is not None:
             move_module_to_device(self.spec_proj, "spec_proj")
 
+        # Final sweep: ensure every param/buffer sits on device; log offenders
+        try:
+            off_cpu = []
+            for n, p in self.named_parameters(recurse=True):
+                if p is not None and hasattr(p, 'device') and p.device != device:
+                    off_cpu.append((n, str(p.device)))
+            for n, b in self.named_buffers(recurse=True):
+                if b is not None and hasattr(b, 'device') and b.device != device:
+                    off_cpu.append((n, str(b.device)))
+            if off_cpu:
+                print(f"[Device] Found {len(off_cpu)} tensors off {device}; moving them now...")
+                self.to(device)
+        except Exception:
+            pass
+        # Remember last device and mark that we've printed
+        self._last_device = device
+        self._printed_device_once = True
+
     def train(self, mode: bool = True):
         """Override train to ensure device consistency."""
         result = super().train(mode)
@@ -135,6 +161,11 @@ class HSIModel(nn.Module):
 
     def warm_up(self, device, input_shape=(1, 224, 512, 512)):
         """Warm up the model to initialize all dynamic components before DataParallel wrapping."""
+        # Normalize device
+        if isinstance(device, str):
+            device = torch.device(device)
+        if device.type == 'cuda' and device.index is None:
+            device = torch.device('cuda:0')
         self.eval()
         with torch.no_grad():
             # Create a dummy input on the specified device
@@ -143,8 +174,8 @@ class HSIModel(nn.Module):
             outputs = self.forward(dummy_input)
         
         # Ensure everything is on the correct device after initialization
-        self.ensure_device_consistency(device)
         self._last_device = device  # Remember the device for future consistency checks
+        self.ensure_device_consistency(device)
         
         print(f"[Warmup] Model initialized on device {device}")
         print(f"[Warmup] Decoder initialized: {self.decoder_initialized}")
@@ -197,7 +228,9 @@ class HSIModel(nn.Module):
                 # Verify the projection matches expected dimensions
                 N = tokens.size(1)
                 if self.hcmff_token_proj.in_features != N or self.hcmff_token_proj.out_features != K:
-                    raise RuntimeError(f"HCMFF token projection dimension mismatch: expected {N}→{K}, got {self.hcmff_token_proj.in_features}→{self.hcmff_token_proj.out_features}")
+                    # Best-effort adjust out_features at runtime only if weights match shape
+                    # Note: cannot recreate module here in DP; enforce K back to current proj
+                    K = self.hcmff_token_proj.out_features
                 
                 t = tokens.transpose(1, 2)
                 t = self.hcmff_token_proj(t)

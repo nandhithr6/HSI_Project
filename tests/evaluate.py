@@ -105,11 +105,13 @@ def plot_predictions(images, true_masks, pred_masks, save_dir, num_samples=5):
         plt.close(fig)
 
 def main():
+    # Help the CUDA allocator reduce fragmentation
+    os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
     parser = argparse.ArgumentParser(description="Evaluate HSI Segmentation Model")
     parser.add_argument('--model-path', type=str, required=True, help='Path to the trained model checkpoint (.pt file)')
     parser.add_argument('--data-dir', type=str, default='/ssd_scratch/placenta/Placenta', help='Root directory of the dataset')
     parser.add_argument('--save-dir', type=str, default='saved/evaluation_results', help='Directory to save evaluation results')
-    parser.add_argument('--batch-size', type=int, default=4, help='Batch size for evaluation')
+    parser.add_argument('--batch-size', type=int, default=1, help='Batch size for evaluation (lower if OOM)')
     parser.add_argument('--num-workers', type=int, default=4)
     parser.add_argument('--seed', type=int, default=42)
     # Dataset/masks
@@ -161,13 +163,70 @@ def main():
 
     print(f"Detected {num_bands} bands and {num_classes} classes.")
 
-    model = HSIModel(num_bands=num_bands, num_classes=num_classes).to(device)
-    missing, unexpected = model.load_state_dict(ckpt['state_dict'], strict=False)
+    # Infer model hyperparameters from checkpoint to avoid size mismatches
+    state = ckpt.get('state_dict', ckpt)
+    # Handle DataParallel checkpoints with 'module.' prefix
+    if isinstance(state, dict) and any(k.startswith('module.') for k in state.keys()):
+        state = {k.replace('module.', '', 1): v for k, v in state.items()}
+    sd_keys = list(state.keys()) if isinstance(state, dict) else []
+
+    # Spatial embed dim from spatial_tokenizer projection out_features
+    spatial_embed_dim = 256
+    patch_size = 16
+    try:
+        w = state.get('spatial_tokenizer.proj.weight', None)
+        if w is not None:
+            # weight shape [embed_dim, (patch_size*patch_size*in_channels)]
+            spatial_embed_dim = int(w.shape[0])
+            in_features = int(w.shape[1])
+            # spatial tokenizer receives 128 channels after fusion
+            in_ch = 128
+            psq = max(1, in_features // in_ch)
+            ps = int(round(psq ** 0.5))
+            if ps * ps * in_ch == in_features:
+                patch_size = ps
+    except Exception:
+        pass
+
+    # Spectral embed dim: align to spatial (training default used same)
+    spectral_embed_dim = spatial_embed_dim
+
+    # HCMFF usage and token count from presence of hcmff/hcmff_token_proj
+    use_hcmff = any(k.startswith('hcmff.') for k in sd_keys) or any(k.startswith('hcmff_token_proj') for k in sd_keys)
+    hcmff_tokens = 256
+    try:
+        hpw = state.get('hcmff_token_proj.weight', None)
+        if hpw is not None:
+            hcmff_tokens = int(hpw.shape[0])
+            use_hcmff = True
+    except Exception:
+        pass
+
+    # Build model with inferred hyperparameters
+    model = HSIModel(
+        num_bands=num_bands,
+        spatial_embed_dim=spatial_embed_dim,
+        spectral_embed_dim=spectral_embed_dim,
+        patch_size=patch_size,
+        num_classes=num_classes,
+        use_hcmff=use_hcmff,
+        hcmff_tokens=hcmff_tokens,
+        verbose=False,
+    ).to(device)
+
+    # Warm-up first to initialize dynamic components (decoder, optional hcmff_token_proj)
+    model.eval()
+    try:
+        model.warm_up(device, input_shape=(1, num_bands, args.crop_size, args.crop_size))
+    except Exception as e:
+        print(f"[Warmup] Skipped or failed: {e}")
+
+    # Now load checkpoint so decoder and other dynamic parts receive weights
+    missing, unexpected = model.load_state_dict(state, strict=False)
     if missing:
         print(f"[Load] Missing keys: {len(missing)}")
     if unexpected:
         print(f"[Load] Unexpected keys: {len(unexpected)}")
-    model.eval()
 
     # --- Computational Metrics ---
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -206,15 +265,26 @@ def main():
     hd_list = []
     hd95_list = []
 
-    with torch.no_grad():
+    def _forward_with_oom_fallback(images: torch.Tensor, max_splits: int = 3) -> torch.Tensor:
+        try:
+            with torch.amp.autocast('cuda', enabled=torch.cuda.is_available()):
+                return model(images)['final_logits']
+        except torch.cuda.OutOfMemoryError:
+            if images.size(0) == 1 or max_splits <= 0:
+                raise
+            torch.cuda.empty_cache()
+            mid = images.size(0) // 2
+            left = _forward_with_oom_fallback(images[:mid], max_splits - 1)
+            right = _forward_with_oom_fallback(images[mid:], max_splits - 1)
+            return torch.cat([left, right], dim=0)
+
+    with torch.inference_mode():
         for i, (images, targets) in enumerate(test_loader):
             images = images.to(device)
             targets = targets.to(device)
 
             start_time = time.time()
-            with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
-                outputs = model(images)
-                logits = outputs['final_logits']
+            logits = _forward_with_oom_fallback(images)
             inference_times.append(time.time() - start_time)
 
             if logits.shape[-2:] != targets.shape[-2:]:
@@ -275,6 +345,16 @@ def main():
 
     # --- Calculate and Display Metrics ---
     cm = confusion_matrix(all_targets.flatten(), all_preds.flatten(), labels=range(num_classes))
+    # Class distribution (GT and predictions)
+    gt_counts = np.bincount(all_targets.flatten(), minlength=num_classes)
+    pr_counts = np.bincount(all_preds.flatten(), minlength=num_classes)
+    gt_ratios = (gt_counts / gt_counts.sum()) if gt_counts.sum() > 0 else np.zeros_like(gt_counts, dtype=float)
+    pr_ratios = (pr_counts / pr_counts.sum()) if pr_counts.sum() > 0 else np.zeros_like(pr_counts, dtype=float)
+    print("\n--- Class Distribution (GT vs Pred) ---")
+    print(tabulate(
+        [[class_names[i], int(gt_counts[i]), f"{gt_ratios[i]:.4f}", int(pr_counts[i]), f"{pr_ratios[i]:.4f}"] for i in range(num_classes)],
+        headers=["Class", "GT Pixels", "GT Ratio", "Pred Pixels", "Pred Ratio"], tablefmt="github"
+    ))
     class_metrics = calculate_metrics_from_cm(cm)
     # AUC macro
     if auc_labels:

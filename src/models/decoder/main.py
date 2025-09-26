@@ -29,15 +29,13 @@ class _NoopCtx:
         return False
 
 def _sdpa_ctx(enable_flash=True, enable_math=False, enable_mem_efficient=True):
+    """Prefer the modern sdpa_kernel; if unavailable, no-op (avoid deprecated fallback)."""
     try:
         from torch.nn.attention import sdpa_kernel as _sdpa
         return _sdpa(enable_flash=enable_flash, enable_math=enable_math, enable_mem_efficient=enable_mem_efficient)
     except Exception:
-        try:
-            from torch.backends.cuda import sdp_kernel as _legacy
-            return _legacy(enable_flash=enable_flash, enable_math=enable_math, enable_mem_efficient=enable_mem_efficient)
-        except Exception:
-            return _NoopCtx()
+        # Avoid deprecated torch.backends.cuda.sdp_kernel() to silence FutureWarning
+        return _NoopCtx()
 
 # =================== HELPER MODULES ===================
 
@@ -86,7 +84,7 @@ class TokenToFeatureConverter(nn.Module):
         
         # 4. Reshape to spatial grid
         B, _, D = normalized.shape
-        features_2d = normalized.view(B, self.spatial_size, self.spatial_size, D)
+        features_2d = normalized.contiguous().view(B, self.spatial_size, self.spatial_size, D)
         
         return features_2d.contiguous()
 
@@ -105,7 +103,7 @@ class TransformerBlock(nn.Module):
         is_4d = x.dim() == 4
         if is_4d:
             B, H, W, C = x.shape
-            x_flat = x.flatten(1, 2)
+            x_flat = x.flatten(1, 2).contiguous()
         else:
             x_flat = x
             
@@ -131,12 +129,12 @@ class CrossScaleAttention(nn.Module):
         
     def forward(self, current_scale: torch.Tensor, prev_scale: torch.Tensor) -> torch.Tensor:
         B, H, W, C = current_scale.shape
-        current_flat = current_scale.flatten(1, 2)
+        current_flat = current_scale.flatten(1, 2).contiguous()
         
         prev_upsampled = F.interpolate(
             prev_scale.permute(0, 3, 1, 2), size=(H, W), mode='bilinear', align_corners=False
         ).permute(0, 2, 3, 1)
-        prev_flat = prev_upsampled.flatten(1, 2)
+        prev_flat = prev_upsampled.flatten(1, 2).contiguous()
         if self.prev_proj is not None:
             prev_flat = self.prev_proj(prev_flat)
 
@@ -160,14 +158,14 @@ class MultiScaleFusion(nn.Module):
         
         resized_features = []
         for feat in scale_features:
-            feat_permuted = feat.permute(0, 3, 1, 2)
+            feat_permuted = feat.permute(0, 3, 1, 2).contiguous()
             if feat_permuted.shape[2:] != (target_h, target_w):
-                 resized = F.interpolate(feat_permuted, size=(target_h, target_w), mode='bilinear', align_corners=False)
+                resized = F.interpolate(feat_permuted, size=(target_h, target_w), mode='bilinear', align_corners=False)
             else:
-                 resized = feat_permuted
+                resized = feat_permuted
             resized_features.append(resized)
 
-        weights = self.weight_generator(resized_features[-1]).view(B, len(resized_features), 1, 1, 1)
+        weights = self.weight_generator(resized_features[-1].contiguous()).view(B, len(resized_features), 1, 1, 1)
         
         stacked_features = torch.stack(resized_features, dim=1)
         fused = torch.sum(weights * stacked_features, dim=1)
@@ -184,9 +182,10 @@ class HierarchicalSegmentationHead(nn.Module):
         self.aux_head_128 = nn.Conv2d(128, num_classes, 1)
         
     def forward(self, main_features: torch.Tensor, aux_features_256: torch.Tensor, aux_features_128: torch.Tensor) -> dict:
-        main_logits = self.main_head(main_features)
-        aux_logits_256 = self.aux_head_256(aux_features_256)
-        aux_logits_128 = self.aux_head_128(aux_features_128)
+        # Ensure NCHW contiguous before convolutions
+        main_logits = self.main_head(main_features.contiguous())
+        aux_logits_256 = self.aux_head_256(aux_features_256.contiguous())
+        aux_logits_128 = self.aux_head_128(aux_features_128.contiguous())
         
         return {
             'main_logits': main_logits,
@@ -230,16 +229,17 @@ class MSTDHSHDecoder(nn.Module):
         self.seg_head = HierarchicalSegmentationHead(feature_dim=32, num_classes=num_classes)
     
     def forward(self, fused_tokens: torch.Tensor) -> Dict[str, torch.Tensor]:
-        F0 = self.token_converter(fused_tokens).permute(0, 3, 1, 2)
+        # Ensure NCHW tensors are contiguous before convs to avoid CUDA misaligned address
+        F0 = self.token_converter(fused_tokens).permute(0, 3, 1, 2).contiguous()
         
-        F1 = self.upsample1(F0)
-        F1_refined = self.transformer1(F1.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+        F1 = self.upsample1(F0.contiguous())
+        F1_refined = self.transformer1(F1.permute(0, 2, 3, 1)).permute(0, 3, 1, 2).contiguous()
         
-        F2 = self.upsample2(F1_refined)
+        F2 = self.upsample2(F1_refined.contiguous())
         F2_cross = self.cross_attn2(F2.permute(0, 2, 3, 1), F1_refined.permute(0, 2, 3, 1))
-        F2_final = self.transformer2(F2_cross).permute(0, 3, 1, 2)
+        F2_final = self.transformer2(F2_cross).permute(0, 3, 1, 2).contiguous()
         
-        F3 = self.upsample3(F2_final)
+        F3 = self.upsample3(F2_final.contiguous())
         F1_aligned = self.align_256_to_64(F1_refined).permute(0, 2, 3, 1)
         F2_aligned = self.align_128_to_64(F2_final).permute(0, 2, 3, 1)
         scale_features_for_fusion = [
@@ -248,10 +248,10 @@ class MSTDHSHDecoder(nn.Module):
             F3.permute(0, 2, 3, 1)
         ]
         F3_fused = self.multi_fusion3(scale_features_for_fusion, target_size=(F3.shape[2], F3.shape[3]))
-        F3_final = self.transformer3(F3_fused).permute(0, 3, 1, 2)
+        F3_final = self.transformer3(F3_fused).permute(0, 3, 1, 2).contiguous()
         
-        F4 = self.upsample4(F3_final)
-        F_output = self.final_refine(F4)
+        F4 = self.upsample4(F3_final.contiguous())
+        F_output = self.final_refine(F4.contiguous())
         
         return self.seg_head(
             main_features=F_output, aux_features_256=F3_final, aux_features_128=F2_final

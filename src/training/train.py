@@ -54,7 +54,7 @@ torch.backends.cudnn.allow_tf32 = False
 torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
 
-    # Preferred SDPA kernel: try new torch.nn.attention.sdpa_kernel; fallback to legacy torch.backends.cuda.sdp_kernel; otherwise no-op
+    # Preferred SDPA kernel: use torch.nn.attention.sdpa_kernel when available; otherwise no-op
 class _NoopCtx:
     def __enter__(self):
         return self
@@ -62,19 +62,10 @@ class _NoopCtx:
         return False
 
 def _sdpa_mem_eff_ctx():
-    # Try new API first
+    """Prefer modern SDPA kernel; if unavailable, use a no-op context to avoid deprecation warnings."""
     try:
         from torch.nn.attention import sdpa_kernel as _sdpa
         return _sdpa(enable_math=False, enable_flash=False, enable_mem_efficient=True)
-    except Exception:
-        pass
-    # Fallback to legacy API
-    try:
-        from torch.backends.cuda import sdp_kernel as _legacy_sdp
-        try:
-            return _legacy_sdp(enable_math=False, enable_flash=False, enable_mem_efficient=True)
-        except TypeError:
-            return _NoopCtx()
     except Exception:
         return _NoopCtx()
 
@@ -191,8 +182,14 @@ class CSVLogger:
             w.writerow(["epoch", "train_loss", "val_loss", "lr"])
 
     def log_epoch(self, epoch: int, train_loss: float, val_loss: float, lr: float):
+        # Ensure directory and file exist; recreate header if missing
+        run_dir = os.path.dirname(self.csv_path)
+        ensure_dir(run_dir)
+        file_exists = os.path.exists(self.csv_path)
         with open(self.csv_path, 'a', newline='') as f:
             w = csv.writer(f)
+            if not file_exists:
+                w.writerow(["epoch", "train_loss", "val_loss", "lr"])
             w.writerow([epoch, train_loss, val_loss, lr])
 
     def close(self):
@@ -225,7 +222,7 @@ class UnifiedFocalLoss(nn.Module):
         delta: focal dice focusing parameter
         smooth: dice smoothing
     """
-    def __init__(self, num_classes: int, lambda_: float = 0.5, alpha: float = 0.25, gamma: float = 2.0, delta: float = 0.5, smooth: float = 1e-8):
+    def __init__(self, num_classes: int, lambda_: float = 0.5, alpha: float = 0.25, gamma: float = 2.0, delta: float = 0.5, smooth: float = 1e-8, dice_exclude_bg: bool = True):
         super().__init__()
         self.num_classes = num_classes
         self.lambda_ = lambda_
@@ -233,8 +230,9 @@ class UnifiedFocalLoss(nn.Module):
         self.gamma = gamma
         self.delta = delta
         self.smooth = smooth
+        self.dice_exclude_bg = dice_exclude_bg
 
-    def forward(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    def forward(self, logits: torch.Tensor, target: torch.Tensor, class_weights: torch.Tensor | None = None) -> torch.Tensor:
         # logits: [B, C, H, W]; target: [B, H, W] (int)
         B, C, H, W = logits.shape
         # Focal CE
@@ -244,13 +242,20 @@ class UnifiedFocalLoss(nn.Module):
         ce = F.nll_loss(logp, target.long(), reduction='none')  # [B,H,W]
         pt = torch.gather(p, dim=1, index=target.long().unsqueeze(1)).squeeze(1)  # [B,H,W]
         alpha_t = self.alpha
-        focal_ce = (alpha_t * (1 - pt) ** self.gamma * ce).mean()
+        if class_weights is not None:
+            # Map per-class weights to each pixel via target
+            wmap = class_weights.to(logits.device)[target.long()]
+        else:
+            wmap = 1.0
+        focal_ce = (wmap * alpha_t * (1 - pt) ** self.gamma * ce).mean()
 
         # Focal Dice (soft dice over one-hot)
         target_1h = F.one_hot(target.long(), num_classes=C).permute(0, 3, 1, 2).float()  # [B,C,H,W]
         probs = F.softmax(logits, dim=1)
         # presence mask per sample per class (True if class has any pixel in target)
         present = (target_1h.sum(dim=(2, 3)) > 0).float()  # [B,C]
+        if self.dice_exclude_bg and C > 1:
+            present[:, 0] = 0.0
         # compute per-sample per-class dice
         intersection = (probs * target_1h).sum(dim=(2, 3))  # [B,C]
         cardinality = (probs.pow(self.delta) + target_1h.pow(self.delta)).sum(dim=(2, 3))  # [B,C]
@@ -530,7 +535,7 @@ def train_one_run(
     # Optimizer/Scheduler/Loss
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=args.t0, T_mult=args.t_mult, eta_min=args.eta_min)
-    loss_fn = UnifiedFocalLoss(num_classes=num_classes_model, lambda_=args.lambda_u, alpha=args.alpha, gamma=args.gamma, delta=args.delta, smooth=args.smooth)
+    loss_fn = UnifiedFocalLoss(num_classes=num_classes_model, lambda_=args.lambda_u, alpha=args.alpha, gamma=args.gamma, delta=args.delta, smooth=args.smooth, dice_exclude_bg=True)
     scaler = torch.amp.GradScaler(enabled=torch.cuda.is_available(), init_scale=1024)
     early = EarlyStopping(patience=args.patience, min_delta=args.min_delta)
 
@@ -603,12 +608,7 @@ def train_one_run(
             ])
 
     for epoch in range(start_epoch, args.epochs):
-        # Ensure device consistency at start of each epoch
-        if hasattr(model, 'ensure_device_consistency'):
-            if isinstance(model, nn.DataParallel):
-                model.module.ensure_device_consistency(device)
-            else:
-                model.ensure_device_consistency(device)
+        # Device consistency is handled at warmup/train transitions; avoid moving modules mid-epoch
         
         model.train()
         if args.progressive_unfreeze:
@@ -698,7 +698,16 @@ def train_one_run(
                                 # Sanitize logits to avoid NaNs/Infs from upstream numerical issues
                                 if not torch.isfinite(logits).all():
                                     logits = torch.nan_to_num(logits, nan=0.0, posinf=1e6, neginf=-1e6)
-                                loss_local = loss_fn(logits, _y)
+                                # Per-batch class weights (inverse frequency), background gets lower weight
+                                with torch.no_grad():
+                                    binc = torch.bincount(_y.view(-1), minlength=num_classes_model).float().to(logits.device)
+                                    # smooth to avoid div-by-zero; lower bg weight by factor
+                                    sm = 1.0
+                                    inv = 1.0 / (binc + sm)
+                                    inv = inv / inv.max().clamp_min(1e-8)
+                                    if inv.numel() > 1:
+                                        inv[0] = inv[0] * 0.25
+                                loss_local = loss_fn(logits, _y, class_weights=inv)
                                 if not torch.isfinite(loss_local):
                                     print("[WARN] Non-finite loss detected; sanitizing and retrying with reduced memory.")
                                     raise RuntimeError("non-finite-loss")
@@ -1193,7 +1202,6 @@ def main():
     parser.add_argument('--epochs', type=int, default=60)
     parser.add_argument('--batch-size', type=int, default=4)
     parser.add_argument('--num-workers', type=int, default=4)
-    parser.add_argument('--folds', type=int, default=5, help='[UNUSED] Only kept for compatibility - script uses train/val/test split')
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--lr', type=float, default=2e-4)
     parser.add_argument('--weight-decay', type=float, default=1e-4)

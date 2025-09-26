@@ -25,26 +25,22 @@ We worked on debugging and improving the HSI segmentation training pipeline. The
 - **Fixed**: Pre-initialize the 1024→128 token projection layer in constructor instead of creating dynamically
 - **Files Modified**: `src/models/full_model.py` (constructor)
 
-## ❌ Critical Issue - Still Unresolved
+## ✅ Critical Issue - Resolved
 
-### Device Placement Error in Epoch 2
-**Error Message**: 
-```
-RuntimeError: module must have its parameters and buffers on device cuda:0 (device_ids[0]) but found one of them on device: cpu
-```
+### Device Placement Error in Epoch 2 (fixed)
+We resolved the multi-GPU DataParallel device mismatch that previously appeared at the start of epoch 2.
 
-**Pattern**: 
-- ✅ First epoch always runs successfully 
-- ❌ Second epoch always fails with CPU device error
-- ❌ Happens even with single GPU + DataParallel
-- ❌ Happens consistently across all configurations
+Key fixes:
+- Removed deprecated `torch.backends.cuda.sdp_kernel()` fallback; use `torch.nn.attention.sdpa_kernel()` with a no-op fallback (no more FutureWarning).
+- Enforced `.contiguous()` on tensors before all conv/transpose/attention ops in the decoder to prevent CUDA "misaligned address" errors.
+- Stabilized DP device placement:
+  - Normalize the master device to `cuda:0` in `ensure_device_consistency()` and call it only during warmup and `train()` transitions (not inside `forward` and not at epoch boundaries).
+  - Avoid moving modules mid-forward, which could desynchronize BatchNorm buffers across replicas.
+- Made `CSVLogger` resilient to missing directories/files to avoid logging crashes.
 
-**What We Tried**:
-1. Dynamic decoder initialization with proper device placement ❌
-2. Pre-initialized all components during warmup ❌  
-3. Added device consistency checks at epoch start ❌
-4. Forced all modules to GPU on every `train()` call ❌
-5. Disabled DataParallel entirely (works but memory issues) ✅
+Validation:
+- 2-epoch and 3-epoch runs complete successfully across 4x RTX 3080 Ti with DP, without device mismatch or CUDA errors.
+- Logs and weights are written to `saved/models/{run-name}/{logs|weights}` as expected.
 
 ## 🔍 Root Cause Analysis
 
