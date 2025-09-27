@@ -461,11 +461,14 @@ def train_one_run(
         return torch.stack(xs, dim=0), torch.stack(ys, dim=0), list(ps)
 
     collate_fn = _collate_with_paths if want_paths else None
-    # Loader kwargs (keep simple)
+    # Optimized loader kwargs for HPC performance
+    optimal_workers = min(12, args.num_workers)  # Cap at 12 for 4-GPU setup with 40 CPUs
     dl_common = {
-        'num_workers': args.num_workers,
+        'num_workers': optimal_workers,
         'pin_memory': True,
         'collate_fn': collate_fn,
+        'prefetch_factor': 4,
+        'persistent_workers': optimal_workers > 0,
     }
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, **dl_common)
     val_loader = DataLoader(val_ds, batch_size=max(1, args.batch_size//2), shuffle=False, **dl_common)
@@ -1190,6 +1193,9 @@ def summarize_class_presence(files: List[str], mask_keys: List[str], limit: int 
 
 
 def main():
+    # Optimize CUDA memory allocation for better performance on HPC
+    os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True,roundup_power2_divisions:16')
+    
     parser = argparse.ArgumentParser(description="Train HSI model on NPZ dataset (ADA-ready)")
     parser.add_argument(
         '--data-dir',
