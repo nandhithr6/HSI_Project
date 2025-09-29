@@ -14,6 +14,7 @@ CHANGES:
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import math
 from .spatial_stream import (
     LocalFeatureStream,
@@ -273,11 +274,27 @@ class HSIModel(nn.Module):
                 num_input_tokens=num_fused_tokens
             ).to(device)
             
+            # Store the target size for resizing decoder output
+            self._target_h = H
+            self._target_w = W
+            
             self.decoder_initialized = True
             if self._should_log(x):
                 print(f"[Warmup] Initialized decoder: {num_fused_tokens} tokens, dim {token_dim}, device {device}")
         
         seg_outputs = self.decoder(fused_tokens)
+        
+        # Resize decoder output to match input size if needed
+        if hasattr(self, '_target_h') and hasattr(self, '_target_w'):
+            final_logits = seg_outputs['final_logits']
+            if final_logits.shape[2] != self._target_h or final_logits.shape[3] != self._target_w:
+                final_logits = F.interpolate(
+                    final_logits, 
+                    size=(self._target_h, self._target_w), 
+                    mode='bilinear', 
+                    align_corners=False
+                )
+                seg_outputs['final_logits'] = final_logits
         
         if self._should_log(x):
             print("[Flow] Decoding complete.")

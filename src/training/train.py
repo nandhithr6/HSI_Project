@@ -32,7 +32,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+import torch.distributed as dist
+import torch.multiprocessing as mp
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
 from torch.utils.data import DataLoader, Dataset
+from torch.cuda.amp import autocast
 from sklearn.metrics import roc_auc_score
 from tabulate import tabulate
 try:
@@ -53,6 +58,356 @@ torch.backends.cuda.matmul.allow_tf32 = False
 torch.backends.cudnn.allow_tf32 = False
 torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
+
+def setup_distributed(rank, world_size):
+    """Initialize distributed training process."""
+    os.environ['MASTER_ADDR'] = 'localhost'
+    os.environ['MASTER_PORT'] = '12355'
+    
+    # Initialize process group
+    dist.init_process_group(
+        backend='nccl',
+        rank=rank,
+        world_size=world_size
+    )
+    
+    # Set device for this process
+    torch.cuda.set_device(rank)
+
+def cleanup_distributed():
+    """Clean up distributed training."""
+    if dist.is_initialized():
+        dist.destroy_process_group()
+
+def run_training_distributed(rank, world_size, args, device, should_print):
+    """Distributed training logic for each GPU."""
+    try:
+        # Get stored files and logger config
+        train_files = args._train_files
+        val_files = args._val_files
+        
+        # Create logger only on rank 0
+        logger = None
+        if should_print:
+            logger = CSVLogger(
+                log_dir=args.log_dir,
+                run_name=None,
+                config=args._logger_config
+            )
+            print(f"Logging to: {logger.run_dir}")
+            print(f"Weights will be saved to: {args.save_dir}")
+        
+        # Datasets with DistributedSampler
+        want_paths = bool(getattr(args, 'very_verbose', False) or getattr(args, 'print_batch_files', False))
+        merge_aliases = {}
+        if getattr(args, 'merge_icg_to_base', False) and args.mask_keys:
+            if 'mask__stroma' in args.mask_keys:
+                merge_aliases.setdefault('mask__stroma', []).extend(['mask__stroma_icg'])
+            if 'mask__artery' in args.mask_keys:
+                merge_aliases.setdefault('mask__artery', []).extend(['mask__artery_icg'])
+
+        train_ds = NPZDataset(
+            train_files, 
+            image_key=args.image_key, 
+            mask_keys=args.mask_keys,
+            crop_size=getattr(args, 'crop_size', None),
+            merge_aliases=merge_aliases
+        )
+        
+        val_ds = NPZDataset(
+            val_files,
+            image_key=args.image_key,
+            mask_keys=args.mask_keys,
+            crop_size=getattr(args, 'crop_size', None),
+            merge_aliases=merge_aliases
+        )
+        
+        # Distributed samplers
+        train_sampler = DistributedSampler(
+            train_ds, 
+            num_replicas=world_size, 
+            rank=rank, 
+            shuffle=True, 
+            drop_last=True
+        )
+        
+        val_sampler = DistributedSampler(
+            val_ds, 
+            num_replicas=world_size, 
+            rank=rank, 
+            shuffle=False, 
+            drop_last=False
+        )
+        
+        # Data loaders
+        train_loader = DataLoader(
+            train_ds,
+            batch_size=args.batch_size // world_size,  # Divide batch size across GPUs
+            sampler=train_sampler,
+            num_workers=args.num_workers,
+            pin_memory=True,
+            drop_last=True
+        )
+        
+        val_loader = DataLoader(
+            val_ds,
+            batch_size=args.batch_size // world_size,
+            sampler=val_sampler,
+            num_workers=args.num_workers,
+            pin_memory=True
+        )
+        
+        # Model setup - infer num_bands from first sample
+        try:
+            sample = train_ds[0]
+            if isinstance(sample, tuple):
+                num_bands = sample[0].shape[0]  # Assume (C, H, W) format
+            else:
+                num_bands = sample.shape[0]
+        except:
+            num_bands = 224  # Default fallback for HSI
+        
+        num_classes_model = len(args.mask_keys) + 1 if args.mask_keys else args.num_classes
+        
+        model = HSIModel(
+            num_bands=num_bands,
+            spatial_embed_dim=args.spatial_embed_dim,
+            spectral_embed_dim=args.spectral_embed_dim,
+            patch_size=args.patch_size,
+            global_patch_size=args.global_patch_size,
+            spectral_window_sizes=args.spectral_window_sizes,
+            spectral_stride=args.spectral_stride,
+            spectral_pixels_per_chunk=args.spectral_pixels_per_chunk,
+            num_classes=num_classes_model,
+            verbose=args.verbose_model and should_print,
+            use_hcmff=getattr(args, 'use_hcmff', False),
+            hcmff_tokens=getattr(args, 'hcmff_tokens', 256)
+        ).to(device)
+        
+        # Warm up model with correct input shape
+        if hasattr(model, 'warm_up'):
+            crop_size = getattr(args, 'crop_size', 512)
+            model.warm_up(device, input_shape=(1, num_bands, crop_size, crop_size))
+            if should_print:
+                print(f"[Warmup] Model initialized for input size: {crop_size}x{crop_size}")
+        
+        # Wrap with DDP
+        model = DDP(
+            model, 
+            device_ids=[rank], 
+            output_device=rank,
+            find_unused_parameters=True  # Needed for complex architectures
+        )
+        
+        if should_print:
+            print(f"Using DistributedDataParallel across {world_size} GPUs")
+        
+        # Optimizer, scheduler, loss
+        optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+        scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=args.t0, T_mult=args.t_mult, eta_min=args.eta_min)
+        loss_fn = UnifiedFocalLoss(num_classes=num_classes_model, lambda_=args.lambda_u, alpha=args.alpha, gamma=args.gamma, delta=args.delta, smooth=args.smooth, dice_exclude_bg=True)
+        scaler = torch.amp.GradScaler(enabled=torch.cuda.is_available(), init_scale=1024)
+        early = EarlyStopping(patience=args.patience, min_delta=args.min_delta)
+        
+        # Training loop
+        best_val_loss = float('inf')
+        best_path = ""
+        
+        for epoch in range(args.epochs):
+            train_sampler.set_epoch(epoch)  # Important for DDP
+            
+            # Training
+            train_metrics = train_epoch_ddp(model, train_loader, optimizer, loss_fn, scaler, scheduler, args, epoch, should_print)
+            
+            # Validation (only on rank 0 to avoid conflicts)
+            if should_print:
+                val_metrics = validate_epoch_ddp(model, val_loader, loss_fn, args, epoch)
+                
+                # Log metrics
+                if logger:
+                    logger.log_epoch(epoch + 1, train_metrics, val_metrics, scheduler.get_last_lr()[0])
+                
+                # Save best model
+                val_loss = val_metrics['Loss']
+                if val_loss < best_val_loss:
+                    best_val_loss = val_loss
+                    best_path = os.path.join(args.save_dir, 'best.pt')
+                    torch.save({
+                        'epoch': epoch + 1,
+                        'model_state_dict': model.module.state_dict(),
+                        'optimizer_state_dict': optimizer.state_dict(),
+                        'scheduler_state_dict': scheduler.state_dict(),
+                        'scaler_state_dict': scaler.state_dict(),
+                        'val_loss': val_loss,
+                        'config': vars(args)
+                    }, best_path)
+                    print(f"[Epoch {epoch+1}] New best validation loss: {val_loss:.4f}")
+                
+                # Early stopping
+                if early(val_loss):
+                    print(f"Early stopping at epoch {epoch+1}")
+                    break
+            
+            # Synchronize all processes
+            dist.barrier()
+        
+        # Cleanup
+        if logger:
+            logger.close()
+            
+        return best_path, best_val_loss
+        
+    except Exception as e:
+        print(f"Error in distributed training rank {rank}: {e}")
+        raise
+    finally:
+        cleanup_distributed()
+
+def train_epoch_ddp(model, train_loader, optimizer, loss_fn, scaler, scheduler, args, epoch, should_print):
+    """DDP training epoch."""
+    model.train()
+    total_loss = 0.0
+    num_batches = len(train_loader)
+    
+    for batch_idx, batch in enumerate(train_loader):
+        x, y = batch  # NPZDataset returns (image, mask)
+            
+        x = x.cuda(non_blocking=True)
+        y = y.cuda(non_blocking=True)
+        
+        optimizer.zero_grad()
+        
+        with autocast():
+            logits = model(x)
+            loss = loss_fn(logits, y)
+        
+        scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+        scaler.step(optimizer)
+        scaler.update()
+        
+        total_loss += loss.item()
+        
+        if should_print and (batch_idx + 1) % getattr(args, 'progress_interval', 10) == 0:
+            print(f"[Epoch {epoch+1}] Batch {batch_idx+1}/{num_batches}, Loss: {loss.item():.4f}")
+    
+    scheduler.step()
+    avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
+    
+    return {'Loss': avg_loss}
+
+def validate_epoch_ddp(model, val_loader, loss_fn, args, epoch):
+    """DDP validation epoch."""
+    model.eval()
+    total_loss = 0.0
+    num_batches = len(val_loader)
+    
+    with torch.no_grad():
+        for batch_idx, batch in enumerate(val_loader):
+            x, y = batch  # NPZDataset returns (image, mask)
+                
+            x = x.cuda(non_blocking=True)
+            y = y.cuda(non_blocking=True)
+            
+            with autocast():
+                logits = model(x)
+                loss = loss_fn(logits, y)
+            
+            total_loss += loss.item()
+    
+    avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
+    return {'Loss': avg_loss}
+
+def train_worker(rank, world_size, args):
+    """Distributed training worker function for each GPU."""
+    # Setup distributed process
+    setup_distributed(rank, world_size)
+    
+    # Set device for this process
+    device = torch.device(f'cuda:{rank}')
+    torch.cuda.set_device(device)
+    
+    # Only print from rank 0 to avoid spam
+    should_print = (rank == 0)
+    
+    if should_print:
+        print(f"Starting distributed training with {world_size} GPUs")
+        print_gpu_summary()
+    
+    # Run the training logic (modified to accept rank and world_size)
+    return run_training_distributed(rank, world_size, args, device, should_print)
+
+def train_epoch_ddp(model, train_loader, optimizer, loss_fn, scaler, scheduler, args, epoch, should_print):
+    """DDP training epoch."""
+    model.train()
+    total_loss = 0.0
+    num_batches = 0
+    
+    for batch_idx, batch in enumerate(train_loader):
+        x, y = batch[:2]  # Handle case where paths are returned
+        x = x.cuda(non_blocking=True)
+        y = y.cuda(non_blocking=True)
+        
+        optimizer.zero_grad()
+        
+        with autocast():
+            output = model(x)
+            # Handle model output - could be tensor or dict
+            if isinstance(output, dict):
+                logits = output.get('logits', output.get('output', list(output.values())[0]))
+            else:
+                logits = output
+            loss = loss_fn(logits, y)
+        
+        scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+        scaler.step(optimizer)
+        scaler.update()
+        
+        total_loss += loss.item()
+        num_batches += 1
+        
+        if should_print and batch_idx % 10 == 0:
+            print(f"[Epoch {epoch+1}] Batch {batch_idx}/{len(train_loader)}, Loss: {loss.item():.4f}")
+    
+    scheduler.step()
+    avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
+    
+    if should_print:
+        print(f"[Epoch {epoch+1}] Train Loss: {avg_loss:.4f}")
+    
+    return {"Loss": avg_loss}
+
+def validate_epoch_ddp(model, val_loader, loss_fn, args, epoch):
+    """DDP validation epoch."""
+    model.eval()
+    total_loss = 0.0
+    num_batches = 0
+    
+    with torch.no_grad():
+        for batch in val_loader:
+            x, y = batch[:2]
+            x = x.cuda(non_blocking=True)
+            y = y.cuda(non_blocking=True)
+            
+            with autocast():
+                output = model(x)
+                # Handle model output - could be tensor or dict
+                if isinstance(output, dict):
+                    logits = output.get('logits', output.get('output', list(output.values())[0]))
+                else:
+                    logits = output
+                loss = loss_fn(logits, y)
+            
+            total_loss += loss.item()
+            num_batches += 1
+    
+    avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
+    print(f"[Epoch {epoch+1}] Val Loss: {avg_loss:.4f}")
+    
+    return {"Loss": avg_loss}
 
     # Preferred SDPA kernel: use torch.nn.attention.sdpa_kernel when available; otherwise no-op
 class _NoopCtx:
@@ -400,7 +755,7 @@ class NPZDataset(Dataset):
 
 
 def _unwrap(m: nn.Module) -> nn.Module:
-    return m.module if isinstance(m, nn.DataParallel) else m
+    return m.module if isinstance(m, (nn.DataParallel, DDP)) else m
 
 
 def ensure_chw_batch(x: torch.Tensor) -> torch.Tensor:
@@ -733,7 +1088,7 @@ def train_one_run(
                             raise
 
             try:
-                replicas = torch.cuda.device_count() if (torch.cuda.is_available() and isinstance(model, nn.DataParallel)) else 1
+                replicas = torch.cuda.device_count() if (torch.cuda.is_available() and isinstance(model, (nn.DataParallel, DDP))) else 1
                 original_bs = x.size(0)
                 if getattr(args, 'force_all_gpus', False) and replicas > 1:
                     rem = original_bs % replicas
@@ -891,7 +1246,7 @@ def train_one_run(
                     pass
                 x = ensure_chw_batch(x).to(device, non_blocking=True)
                 y = y.to(device, non_blocking=True)
-                replicas = torch.cuda.device_count() if (torch.cuda.is_available() and isinstance(model, nn.DataParallel)) else 1
+                replicas = torch.cuda.device_count() if (torch.cuda.is_available() and isinstance(model, (nn.DataParallel, DDP))) else 1
                 original_bs = x.size(0)
                 if getattr(args, 'force_all_gpus', False) and replicas > 1:
                     rem = original_bs % replicas
@@ -1379,14 +1734,30 @@ def main():
         except Exception as e:
             print(f"[WARN] Could not write class presence CSV: {e}")
 
-    # Single training run
-    best_path, best_loss = train_one_run(train_files, val_files, args, logger)
-    print(f"--- Training Complete ---")
-    print(f"Best Val Loss: {best_loss:.4f} | Model saved to: {best_path}")
-    print(f"-------------------------")
+    # Check if multi-GPU and force all GPUs
+    if torch.cuda.is_available() and torch.cuda.device_count() > 1 and getattr(args, 'force_all_gpus', False):
+        print(f"Launching distributed training on {torch.cuda.device_count()} GPUs")
+        
+        # Store files for distributed workers
+        args._train_files = train_files
+        args._val_files = val_files
+        args._test_files = test_files
+        args._logger_config = {k: (v if isinstance(v, (int, float, str, bool, type(None))) else str(v)) for k, v in vars(args).items()}
+        
+        # Launch distributed training
+        world_size = torch.cuda.device_count()
+        mp.spawn(train_worker, args=(world_size, args), nprocs=world_size, join=True)
+        
+        print("--- Distributed Training Complete ---")
+    else:
+        # Single GPU training
+        best_path, best_loss = train_one_run(train_files, val_files, args, logger)
+        print(f"--- Training Complete ---")
+        print(f"Best Val Loss: {best_loss:.4f} | Model saved to: {best_path}")
+        print(f"-------------------------")
 
-    print("\nTo evaluate the best model on the test set, run the following command:")
-    print(f"python tests/evaluate.py --model-path {best_path} --data-dir {args.data_dir}")
+        print("\nTo evaluate the best model on the test set, run the following command:")
+        print(f"python tests/evaluate.py --model-path {best_path} --data-dir {args.data_dir}")
 
     # Close logger
     logger.close()
