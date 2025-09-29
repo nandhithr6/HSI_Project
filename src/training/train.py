@@ -12,7 +12,7 @@ Features:
 
 Notes:
 - On ADA, datasets live under /ssd_scratch; pass --data-dir "/ssd_scratch/<user>/<dataset>"
-- Checkpoints/weights saved to saved/models by default
+- By default, checkpoints/weights are saved to /scratch/HSI_proj/weights and logs to /scratch/HSI_proj/logs
 """
 
 import argparse
@@ -22,8 +22,9 @@ import json
 import os
 import random
 
-# Ensure CuBLAS deterministic workspace is set before importing torch (prevents Mamba determinism crash)
+# Ensure allocator and cuBLAS configs are set before importing torch
 os.environ.setdefault('CUBLAS_WORKSPACE_CONFIG', ':4096:8')
+os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True,max_split_size_mb:64')
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
@@ -33,6 +34,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset
+try:
+    from torch.utils.data.distributed import DistributedSampler
+except Exception:
+    DistributedSampler = None
 from sklearn.metrics import roc_auc_score
 from tabulate import tabulate
 try:
@@ -48,13 +53,19 @@ except Exception:
 
 # Local imports
 from src.models.full_model import HSIModel
+try:
+    import torch.distributed as dist
+    from torch.nn.parallel import DistributedDataParallel as DDP
+except Exception:
+    dist = None
+    DDP = None
 
 torch.backends.cuda.matmul.allow_tf32 = False
 torch.backends.cudnn.allow_tf32 = False
 torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
 
-    # Preferred SDPA kernel: use torch.nn.attention.sdpa_kernel when available; otherwise no-op
+    # Preferred SDPA kernel: prefer FlashAttention on Ampere+ if available; fallback to mem-efficient; else no-op
 class _NoopCtx:
     def __enter__(self):
         return self
@@ -62,12 +73,18 @@ class _NoopCtx:
         return False
 
 def _sdpa_mem_eff_ctx():
-    """Prefer modern SDPA kernel; if unavailable, use a no-op context to avoid deprecation warnings."""
+    """Prefer Flash SDPA when available, else mem-efficient; if unavailable, use a no-op context."""
     try:
-        from torch.nn.attention import sdpa_kernel as _sdpa
-        return _sdpa(enable_math=False, enable_flash=False, enable_mem_efficient=True)
+        # PyTorch >=2.1 preferred API
+        from torch.backends.cuda import sdp_kernel as _sdp
+        return _sdp(enable_math=False, enable_flash=True, enable_mem_efficient=True)
     except Exception:
-        return _NoopCtx()
+        try:
+            # Older fallback API
+            from torch.nn.attention import sdpa_kernel as _sdpa
+            return _sdpa(enable_math=False, enable_flash=True, enable_mem_efficient=True)
+        except Exception:
+            return _NoopCtx()
 
 ###############################################
 # Utilities and helpers
@@ -168,9 +185,13 @@ def _hd95_per_image(gt: np.ndarray, pr: np.ndarray) -> Tuple[float, float]:
 
 class CSVLogger:
     def __init__(self, log_dir: str, run_name: Optional[str], config: Dict):
-        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-        name = run_name or f"run-{ts}"
-        self.run_dir = os.path.join(log_dir, name)
+        # If run_name is None, write directly into the provided log_dir (no nested timestamp folder)
+        if run_name is None:
+            self.run_dir = log_dir
+        else:
+            ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+            name = run_name or f"run-{ts}"
+            self.run_dir = os.path.join(log_dir, name)
         ensure_dir(self.run_dir)
         # write config
         with open(os.path.join(self.run_dir, 'config.json'), 'w') as f:
@@ -400,7 +421,11 @@ class NPZDataset(Dataset):
 
 
 def _unwrap(m: nn.Module) -> nn.Module:
-    return m.module if isinstance(m, nn.DataParallel) else m
+    if isinstance(m, nn.DataParallel):
+        return m.module
+    if DDP is not None and isinstance(m, DDP):
+        return m.module
+    return m
 
 
 def ensure_chw_batch(x: torch.Tensor) -> torch.Tensor:
@@ -421,7 +446,18 @@ def train_one_run(
     args: argparse.Namespace,
     logger: Optional[CSVLogger]
 ) -> Tuple[str, float]:
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    # Determine device (DDP-aware)
+    ddp_env_rank = os.environ.get('LOCAL_RANK', None)
+    ddp_active = bool(getattr(args, 'ddp', False) and (dist is not None) and torch.cuda.is_available() and ddp_env_rank is not None and (dist.is_initialized() if hasattr(dist, 'is_initialized') else False))
+    if ddp_active:
+        local_rank = int(os.environ.get('LOCAL_RANK', '0'))
+        device = torch.device(f'cuda:{local_rank}')
+        try:
+            torch.cuda.set_device(device)
+        except Exception:
+            pass
+    else:
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     # No TensorBoard writer (disabled per user request)
 
     # Datasets / Loaders
@@ -467,8 +503,20 @@ def train_one_run(
         'pin_memory': True,
         'collate_fn': collate_fn,
     }
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, **dl_common)
-    val_loader = DataLoader(val_ds, batch_size=max(1, args.batch_size//2), shuffle=False, **dl_common)
+    if args.num_workers > 0:
+        dl_common['persistent_workers'] = True
+        dl_common['prefetch_factor'] = 2
+    # Build DataLoaders (use DistributedSampler if DDP is active)
+    if ddp_active and (DistributedSampler is not None):
+        world_size = dist.get_world_size()
+        rank = dist.get_rank()
+        train_sampler = DistributedSampler(train_ds, num_replicas=world_size, rank=rank, shuffle=True, drop_last=False)
+        val_sampler = DistributedSampler(val_ds, num_replicas=world_size, rank=rank, shuffle=False, drop_last=False)
+        train_loader = DataLoader(train_ds, batch_size=args.batch_size, sampler=train_sampler, shuffle=False, **dl_common)
+        val_loader = DataLoader(val_ds, batch_size=max(1, args.batch_size//2), sampler=val_sampler, shuffle=False, **dl_common)
+    else:
+        train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, **dl_common)
+        val_loader = DataLoader(val_ds, batch_size=max(1, args.batch_size//2), shuffle=False, **dl_common)
 
     # Determine number of classes
     if len(train_ds.class_map) > 0:
@@ -496,8 +544,17 @@ def train_one_run(
         num_classes=num_classes_model,
         verbose=args.verbose_model,
         use_hcmff=getattr(args, 'use_hcmff', False),
-        hcmff_tokens=getattr(args, 'hcmff_tokens', 256)
+        hcmff_tokens=getattr(args, 'hcmff_tokens', 256),
+        both_fusions=getattr(args, 'both_fusions', False)
     ).to(device)
+
+    # Optional memory format optimization
+    if getattr(args, 'channels_last', False):
+        try:
+            model = model.to(memory_format=torch.channels_last)
+            print("[Perf] Using channels_last memory format for model")
+        except Exception as e:
+            print(f"[Perf] channels_last not applied: {e}")
 
     # channels_last disabled per request
 
@@ -513,18 +570,27 @@ def train_one_run(
         except Exception as e:
             print(f"[Perf] torch.compile failed (continuing uncompiled): {e}")
 
-    # Multi-GPU support
-    if torch.cuda.is_available() and torch.cuda.device_count() > 1:
-        total_gpus = torch.cuda.device_count()
-        if getattr(args, 'force_all_gpus', False):
-            used_gpus = total_gpus
-        else:
-            used_gpus = max(1, min(total_gpus, args.batch_size))
-        device_ids = list(range(used_gpus))
-        model = nn.DataParallel(model, device_ids=device_ids)
-        print(f"Using DataParallel across {used_gpus}/{total_gpus} GPUs")
-        if used_gpus < total_gpus and not getattr(args, 'force_all_gpus', False):
-            print(f"[INFO] Limiting GPUs to {used_gpus} to avoid zero-size microbatches (batch={args.batch_size}).")
+    # Multi-GPU support: prefer DDP when enabled, else DataParallel
+    if ddp_active and (DDP is not None):
+        try:
+            local_rank = int(os.environ.get('LOCAL_RANK', '0'))
+            model = DDP(model, device_ids=[local_rank], output_device=local_rank)
+            if dist.get_rank() == 0:
+                print(f"Using DistributedDataParallel across {dist.get_world_size()} GPUs")
+        except Exception as e:
+            print(f"[DDP] Failed to wrap model in DDP: {e}. Proceeding without DDP.")
+    else:
+        if torch.cuda.is_available() and torch.cuda.device_count() > 1:
+            total_gpus = torch.cuda.device_count()
+            if getattr(args, 'force_all_gpus', False):
+                used_gpus = total_gpus
+            else:
+                used_gpus = max(1, min(total_gpus, args.batch_size))
+            device_ids = list(range(used_gpus))
+            model = nn.DataParallel(model, device_ids=device_ids)
+            print(f"Using DataParallel across {used_gpus}/{total_gpus} GPUs")
+            if used_gpus < total_gpus and not getattr(args, 'force_all_gpus', False):
+                print(f"[INFO] Limiting GPUs to {used_gpus} to avoid zero-size microbatches (batch={args.batch_size}).")
 
     if args.verbose_model:
         print("Model pipeline: [Spatial Local] + [Spatial Global] -> Fusion -> SpatialTokenizer || SpectralStream -> TCME -> Decoder")
@@ -533,7 +599,12 @@ def train_one_run(
             print("Using masks (class order): background=0, " + ", ".join(f"{k}={v}" for k,v in train_ds.class_map.items()))
 
     # Optimizer/Scheduler/Loss
-    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    # Optimizer (prefer fused AdamW on CUDA for speed)
+    try:
+        optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay, fused=True)
+        print("[Perf] Using fused AdamW optimizer")
+    except TypeError:
+        optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=args.t0, T_mult=args.t_mult, eta_min=args.eta_min)
     loss_fn = UnifiedFocalLoss(num_classes=num_classes_model, lambda_=args.lambda_u, alpha=args.alpha, gamma=args.gamma, delta=args.delta, smooth=args.smooth, dice_exclude_bg=True)
     scaler = torch.amp.GradScaler(enabled=torch.cuda.is_available(), init_scale=1024)
@@ -543,6 +614,37 @@ def train_one_run(
     ensure_dir(args.save_dir)
     best_path = os.path.join(args.save_dir, "best.pt")
     last_path = os.path.join(args.save_dir, "last.pt")
+
+    # Graceful interrupt checkpoint saver
+    def _save_interrupt_ckpt(epoch_idx: int = -1):
+        try:
+            if ddp_active and (dist is not None) and hasattr(dist, 'get_rank'):
+                try:
+                    if dist.get_rank() != 0:
+                        return
+                except Exception:
+                    pass
+            state = _unwrap(model).state_dict()
+            inter_path = os.path.join(args.save_dir, 'interrupt.pt')
+            torch.save({
+                'state_dict': state,
+                'optimizer': optimizer.state_dict(),
+                'scheduler': scheduler.state_dict(),
+                'scaler': (scaler.state_dict() if hasattr(scaler, 'state_dict') else {}),
+                'epoch': epoch_idx,
+            }, inter_path)
+            print(f"[Signal] Saved interrupt checkpoint to {inter_path}")
+        except Exception as e:
+            print(f"[Signal] Failed to save interrupt checkpoint: {e}")
+    try:
+        import signal
+        def _sig_handler(sig, frame):
+            _save_interrupt_ckpt()
+            raise KeyboardInterrupt()
+        signal.signal(signal.SIGINT, _sig_handler)
+        signal.signal(signal.SIGTERM, _sig_handler)
+    except Exception:
+        pass
 
     # Optional auto-resume
     start_epoch = 0
@@ -606,6 +708,50 @@ def train_one_run(
                 'macro_dice_no_bg','macro_iou_no_bg','balanced_accuracy','kappa','mcc','auc_macro','hd_mean','hd95_mean',
                 'params_million','flops_gmac','val_time_sec','gpu_mem_mb'
             ])
+(mvenv) chinmay.majithia@gnode109:~/HSI_Project$ bash -lc "python -m pyflakes src/training/train.py || true"
+/home/chinmay.majithia/miniconda3/bin/python: No module named pyflakes
+    # Propagate gradient checkpointing preferences into modules (if present)
+    try:
+        u = _unwrap(model)
+        if hasattr(u, 'local_stream') and hasattr(u.local_stream, 'use_checkpointing'):
+            u.local_stream.use_checkpointing = bool(args.grad_checkpoint)
+        if hasattr(u, 'global_stream') and hasattr(u.global_stream, 'use_checkpointing'):
+            u.global_stream.use_checkpointing = bool(args.grad_checkpoint)
+        if hasattr(u, 'spectral_stream') and hasattr(u.spectral_stream, 'use_checkpointing'):
+            u.spectral_stream.use_checkpointing = bool(args.grad_checkpoint)
+    except Exception:
+        pass
+
+    # EMA weights (optional)
+    ema = None
+    if args.ema_decay > 0:
+        class _EMA:
+            def __init__(self, module: nn.Module, decay: float):
+                self.decay = decay
+                self.shadow = {}
+                for n, p in _unwrap(module).named_parameters():
+                    if p.requires_grad:
+                        self.shadow[n] = p.detach().clone()
+            def update(self, module: nn.Module):
+                with torch.no_grad():
+                    for n, p in _unwrap(module).named_parameters():
+                        if p.requires_grad and n in self.shadow:
+                            self.shadow[n].mul_(self.decay).add_(p.detach(), alpha=1.0 - self.decay)
+            def apply_to(self, module: nn.Module):
+                self._backup = {}
+                for n, p in _unwrap(module).named_parameters():
+                    if p.requires_grad and n in self.shadow:
+                        self._backup[n] = p.detach().clone()
+                        p.data.copy_(self.shadow[n])
+            def restore(self, module: nn.Module):
+                if not hasattr(self, '_backup'): return
+                for n, p in _unwrap(module).named_parameters():
+                    if p.requires_grad and n in self._backup:
+                        p.data.copy_(self._backup[n])
+                self._backup = {}
+        ema = _EMA(model, args.ema_decay)
+
+    accum_steps = max(1, int(getattr(args, 'accum_steps', 1)))
 
     for epoch in range(start_epoch, args.epochs):
         # Device consistency is handled at warmup/train transitions; avoid moving modules mid-epoch
@@ -626,7 +772,8 @@ def train_one_run(
 
         # Epoch start summaries
         try:
-            print(f"[Epoch {epoch+1}] Train: batches={len(train_loader)}, dataset={len(train_loader.dataset)}")
+            if (not ddp_active) or (dist.get_rank() == 0):
+                print(f"[Epoch {epoch+1}] Train: batches={len(train_loader)}, dataset={len(train_loader.dataset)}")
         except Exception:
             pass
 
@@ -640,7 +787,7 @@ def train_one_run(
             or getattr(args, 'very_verbose', False)
         )
 
-        for batch_idx, batch in enumerate(train_loader):
+    for batch_idx, batch in enumerate(train_loader):
             if want_paths:
                 x, y, paths = batch
             else:
@@ -651,12 +798,48 @@ def train_one_run(
                 u.verbose = vflag
                 if hasattr(u, 'decoder'):
                     u.decoder.verbose = vflag
+                # Set workflow logging context if requested
+                if getattr(args, 'workflow_logs', False):
+                    # Log every N batches as configured
+                    do_wflow = ((batch_idx % max(1, args.workflow_interval)) == 0)
+                    u.workflow_verbose = bool(do_wflow)
+                    u.workflow_ctx = {
+                        'phase': 'train',
+                        'epoch': epoch + 1,
+                        'epochs': args.epochs,
+                        'batch': batch_idx + 1,
+                        'batches': len(train_loader),
+                    }
+                    # Provide a log_fn that writes to console and file
+                    def _wf_log(msg: str):
+                        try:
+                            if (not ddp_active) or (dist.get_rank() == 0):
+                                print(msg)
+                            if batch_log_path is not None:
+                                with open(batch_log_path, 'a') as bf:
+                                    bf.write(msg + "\n")
+                        except Exception:
+                            pass
+                    u.log_fn = _wf_log
+                else:
+                    # Disable per-block workflow logs
+                    u.workflow_verbose = False
+                    u.workflow_ctx = None
+                    u.log_fn = None
             except Exception:
                 pass
 
-            x = ensure_chw_batch(x).to(device, non_blocking=True)
+            x = ensure_chw_batch(x)
+            if getattr(args, 'channels_last', False):
+                try:
+                    x = x.to(device, non_blocking=True, memory_format=torch.channels_last)
+                except Exception:
+                    x = x.to(device, non_blocking=True)
+            else:
+                x = x.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True)
-            optimizer.zero_grad(set_to_none=True)
+            if (batch_idx % accum_steps) == 0:
+                optimizer.zero_grad(set_to_none=True)
 
             def _is_nccl_broadcast_error(err: Exception) -> bool:
                 s = str(err)
@@ -698,15 +881,20 @@ def train_one_run(
                                 # Sanitize logits to avoid NaNs/Infs from upstream numerical issues
                                 if not torch.isfinite(logits).all():
                                     logits = torch.nan_to_num(logits, nan=0.0, posinf=1e6, neginf=-1e6)
-                                # Per-batch class weights (inverse frequency), background gets lower weight
+                                # Per-batch class weights (inverse frequency), background gets much lower weight
                                 with torch.no_grad():
                                     binc = torch.bincount(_y.view(-1), minlength=num_classes_model).float().to(logits.device)
-                                    # smooth to avoid div-by-zero; lower bg weight by factor
+                                    # smooth to avoid div-by-zero; aggressive bg weight reduction for imbalanced data
                                     sm = 1.0
                                     inv = 1.0 / (binc + sm)
                                     inv = inv / inv.max().clamp_min(1e-8)
                                     if inv.numel() > 1:
-                                        inv[0] = inv[0] * 0.25
+                                        # Much more aggressive background downweighting for sparse classes
+                                        inv[0] = inv[0] * 0.05  # Reduced from 0.25 to 0.05
+                                        # Boost minority classes
+                                        for i in range(1, inv.numel()):
+                                            if binc[i] < (binc.sum() * 0.01):  # Classes < 1% of pixels
+                                                inv[i] = inv[i] * 3.0  # 3x boost for very rare classes
                                 loss_local = loss_fn(logits, _y, class_weights=inv)
                                 if not torch.isfinite(loss_local):
                                     print("[WARN] Non-finite loss detected; sanitizing and retrying with reduced memory.")
@@ -748,8 +936,11 @@ def train_one_run(
                     seen_train += int(original_bs)
                 except Exception:
                     pass
+                # Gradient accumulation scaling
+                if accum_steps > 1:
+                    loss = loss / accum_steps
                 # Per-batch verbose progress
-                if getattr(args, 'very_verbose', False) and ((batch_idx % max(1, args.progress_interval)) == 0):
+                if ((not ddp_active) or (dist.get_rank() == 0)) and getattr(args, 'very_verbose', False) and ((batch_idx % max(1, args.progress_interval)) == 0):
                     seen = min((batch_idx + 1) * original_bs, len(train_loader.dataset))
                     msg = f"[Train] Ep {epoch+1}/{args.epochs} | Batch {batch_idx+1}/{len(train_loader)} | Seen {seen}/{len(train_loader.dataset)} | Loss {loss.item():.4f}"
                     if want_paths:
@@ -823,41 +1014,77 @@ def train_one_run(
 
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
+            
+            # Monitor gradient norms for debugging
+            if getattr(args, 'very_verbose', False) and batch_idx == 0 and epoch < 3:
+                total_norm = 0
+                param_count = 0
+                for p in model.parameters():
+                    if p.grad is not None:
+                        param_norm = p.grad.data.norm(2)
+                        total_norm += param_norm.item() ** 2
+                        param_count += 1
+                total_norm = total_norm ** (1. / 2)
+                print(f"[Debug] Epoch {epoch+1}, Batch {batch_idx+1}: Grad norm = {total_norm:.4f}, Params with grad = {param_count}")
+            
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.max_grad_norm)
-            scaler.step(optimizer)
-            scaler.update()
+            # Optimizer step on accumulation boundary or last batch
+            do_step = ((batch_idx + 1) % accum_steps == 0) or (batch_idx + 1 == len(train_loader))
+            if do_step:
+                scaler.step(optimizer)
+                scaler.update()
+                if ema is not None:
+                    ema.update(model)
             train_loss += loss.item() * x.size(0)
             verbose_once_done = True
 
         train_loss /= max(1, len(train_loader.dataset))
         # Epoch end summary (train)
         try:
-            tmsg = f"[Epoch {epoch+1}] Train seen {seen_train}/{len(train_loader.dataset)} samples"
-            print(tmsg)
-            if batch_log_path is not None:
-                with open(batch_log_path, 'a') as bf:
-                    bf.write(tmsg + "\n")
+            if (not ddp_active) or (dist.get_rank() == 0):
+                tmsg = f"[Epoch {epoch+1}] Train seen {seen_train}/{len(train_loader.dataset)} samples"
+                print(tmsg)
+                if batch_log_path is not None:
+                    with open(batch_log_path, 'a') as bf:
+                        bf.write(tmsg + "\n")
         except Exception:
             pass
 
         # Validation
+        # Validation (use EMA weights if enabled)
         model.eval()
+        if ema is not None:
+            try:
+                ema.apply_to(model)
+            except Exception:
+                pass
         try:
             u = _unwrap(model)
             u.verbose = False
             if hasattr(u, 'decoder'):
                 u.decoder.verbose = False
+            # Disable workflow logs by default for val unless explicitly enabled
+            if getattr(args, 'workflow_logs', False):
+                u.workflow_ctx = {
+                    'phase': 'val',
+                    'epoch': epoch + 1,
+                    'epochs': args.epochs,
+                    'batch': 0,
+                    'batches': 0,
+                }
         except Exception:
             pass
         val_loss = 0.0
         # Metrics accumulators
-        cm_accum = torch.zeros((num_classes_model, num_classes_model), dtype=torch.int64)
+        cm_accum = torch.zeros((num_classes_model, num_classes_model), dtype=torch.int64, device=(device if torch.cuda.is_available() else 'cpu'))
         y_true_flat = []
         y_pred_flat = []
         # AUC sampling accumulators
         auc_labels = []
         auc_scores = []
         auc_cap = getattr(args, 'auc_max_pixels', 200000)
+        if ddp_active and dist.get_rank() != 0:
+            auc_cap = 0
         # Timing/memory
         if torch.cuda.is_available():
             torch.cuda.reset_peak_memory_stats()
@@ -868,7 +1095,8 @@ def train_one_run(
         hd95_list = []
         with torch.no_grad():
             try:
-                print(f"[Epoch {epoch+1}] Val: batches={len(val_loader)}, dataset={len(val_loader.dataset)}")
+                if (not ddp_active) or (dist.get_rank() == 0):
+                    print(f"[Epoch {epoch+1}] Val: batches={len(val_loader)}, dataset={len(val_loader.dataset)}")
             except Exception:
                 pass
             seen_val = 0
@@ -884,6 +1112,31 @@ def train_one_run(
                     u.verbose = vflag
                     if hasattr(u, 'decoder'):
                         u.decoder.verbose = vflag
+                    # Per-batch workflow logs for validation if enabled
+                    if getattr(args, 'workflow_logs', False):
+                        do_wflow = ((vb_idx % max(1, args.workflow_interval)) == 0)
+                        u.workflow_verbose = bool(do_wflow)
+                        u.workflow_ctx = {
+                            'phase': 'val',
+                            'epoch': epoch + 1,
+                            'epochs': args.epochs,
+                            'batch': vb_idx + 1,
+                            'batches': len(val_loader),
+                        }
+                        def _wf_log_val(msg: str):
+                            try:
+                                if (not ddp_active) or (dist.get_rank() == 0):
+                                    print(msg)
+                                if batch_log_path is not None:
+                                    with open(batch_log_path, 'a') as bf:
+                                        bf.write(msg + "\n")
+                            except Exception:
+                                pass
+                        u.log_fn = _wf_log_val
+                    else:
+                        u.workflow_verbose = False
+                        u.workflow_ctx = None
+                        u.log_fn = None
                 except Exception:
                     pass
                 x = ensure_chw_batch(x).to(device, non_blocking=True)
@@ -899,7 +1152,7 @@ def train_one_run(
                 try:
                     # Reuse safe forward with guards
                     loss, logits = _safe_forward(x, y)
-                    if getattr(args, 'very_verbose', False) and ((vb_idx % max(1, args.progress_interval)) == 0):
+                    if ((not ddp_active) or (dist.get_rank() == 0)) and getattr(args, 'very_verbose', False) and ((vb_idx % max(1, args.progress_interval)) == 0):
                         vmsg = f"[Val]   Ep {epoch+1}/{args.epochs} | Batch {vb_idx+1}/{len(val_loader)} | Loss {loss.item():.4f}"
                         if want_paths:
                             try:
@@ -941,9 +1194,10 @@ def train_one_run(
                 val_loss += loss.item() * original_bs
                 # Metrics update
                 preds = torch.argmax(logits, dim=1)
-                cm_accum += _confusion_matrix_torch(preds.cpu(), y.cpu(), num_classes_model)
-                y_true_flat.append(y.view(-1).cpu().numpy())
-                y_pred_flat.append(preds.view(-1).cpu().numpy())
+                cm_accum += _confusion_matrix_torch(preds, y, num_classes_model)
+                if (not ddp_active) or (dist.get_rank() == 0):
+                    y_true_flat.append(y.view(-1).detach().cpu().numpy())
+                    y_pred_flat.append(preds.view(-1).detach().cpu().numpy())
                 # AUC sampling
                 if auc_cap > 0:
                     probs = F.softmax(logits, dim=1).detach().cpu()
@@ -971,19 +1225,45 @@ def train_one_run(
                             hd, hd95 = _hd95_per_image(gt_c, pr_c)
                             if not np.isnan(hd): hd_list.append(hd)
                             if not np.isnan(hd95): hd95_list.append(hd95)
-        val_loss /= max(1, len(val_loader.dataset))
+        # Normalize/Reduce val loss across processes
+        if ddp_active:
+            val_loss_tensor = torch.tensor([val_loss], dtype=torch.float32, device=device)
+            try:
+                dist.all_reduce(val_loss_tensor, op=dist.ReduceOp.SUM)
+            except Exception:
+                pass
+            try:
+                total_count = torch.tensor([len(val_loader.dataset)], dtype=torch.float32, device=device)
+                dist.broadcast(total_count, src=0)
+                val_loss = float((val_loss_tensor / total_count).item())
+            except Exception:
+                val_loss = float(val_loss_tensor.item() / max(1, len(val_loader.dataset)))
+        else:
+            val_loss /= max(1, len(val_loader.dataset))
+        # Restore non-EMA weights after validation
+        if ema is not None:
+            try:
+                ema.restore(model)
+            except Exception:
+                pass
         # Epoch end summary (val)
         try:
-            vmsg = f"[Epoch {epoch+1}] Val   seen {seen_val}/{len(val_loader.dataset)} samples"
-            print(vmsg)
-            if batch_log_path is not None:
-                with open(batch_log_path, 'a') as bf:
-                    bf.write(vmsg + "\n")
+            if (not ddp_active) or (dist.get_rank() == 0):
+                vmsg = f"[Epoch {epoch+1}] Val   seen {seen_val}/{len(val_loader.dataset)} samples"
+                print(vmsg)
+                if batch_log_path is not None:
+                    with open(batch_log_path, 'a') as bf:
+                        bf.write(vmsg + "\n")
         except Exception:
             pass
 
         # Aggregate metrics
-        cm_np = cm_accum.numpy()
+        if ddp_active:
+            try:
+                dist.all_reduce(cm_accum, op=dist.ReduceOp.SUM)
+            except Exception:
+                pass
+        cm_np = cm_accum.detach().cpu().numpy()
         stats = _per_class_stats_from_cm(cm_np)
         macro = {k: float(np.nanmean(v)) for k, v in stats.items()}
         if num_classes_model > 1:
@@ -1050,11 +1330,12 @@ def train_one_run(
             ['ValTime(s)', f"{val_time_sec:.2f}"],
             ['GPU Mem(MB)', f"{gpu_mem_mb:.1f}"],
         ]
-        print("\nValidation metrics (epoch-level):")
-        print(tabulate(table, headers=['Metric', 'Value'], tablefmt='github'))
+        if (not ddp_active) or (dist.get_rank() == 0):
+            print("\nValidation metrics (epoch-level):")
+            print(tabulate(table, headers=['Metric', 'Value'], tablefmt='github'))
 
         # Write CSV
-        if metrics_csv is not None:
+        if ((not ddp_active) or (dist.get_rank() == 0)) and (metrics_csv is not None):
             try:
                 with open(metrics_csv, 'a', newline='') as f:
                     w = csv.writer(f)
@@ -1075,33 +1356,54 @@ def train_one_run(
             scheduler.step(epoch - args.warmup_epochs)
 
         current_lr = optimizer.param_groups[0]['lr']
-        print(f"Epoch {epoch+1}/{args.epochs} | Train {train_loss:.4f} | Val {val_loss:.4f} | LR {current_lr:.6f}")
+        if (not ddp_active) or (dist.get_rank() == 0):
+            print(f"Epoch {epoch+1}/{args.epochs} | Train {train_loss:.4f} | Val {val_loss:.4f} | LR {current_lr:.6f}")
 
         if logger is not None:
             logger.log_epoch(epoch + 1, train_loss, val_loss, current_lr)
 
         # Checkpointing (extended last.pt for resume state)
-        state = _unwrap(model).state_dict()
-        try:
-            prev_best = torch.load(best_path, map_location='cpu').get('val_loss', float('inf')) if os.path.exists(best_path) else float('inf')
-        except Exception:
-            prev_best = float('inf')
-        if (val_loss < prev_best):
-            torch.save({'state_dict': state, 'val_loss': val_loss, 'epoch': epoch}, best_path)
-        torch.save({
-            'state_dict': state,
-            'val_loss': val_loss,
-            'epoch': epoch,
-            'optimizer': optimizer.state_dict(),
-            'scheduler': scheduler.state_dict(),
-            'scaler': (scaler.state_dict() if hasattr(scaler, 'state_dict') else {})
-        }, last_path)
+        if (not ddp_active) or (dist.get_rank() == 0):
+            state = _unwrap(model).state_dict()
+            try:
+                prev_best = torch.load(best_path, map_location='cpu').get('val_loss', float('inf')) if os.path.exists(best_path) else float('inf')
+            except Exception:
+                prev_best = float('inf')
+            if (val_loss < prev_best):
+                torch.save({'state_dict': state, 'val_loss': val_loss, 'epoch': epoch}, best_path)
+            # Always save a per-epoch checkpoint
+            try:
+                epoch_ckpt = os.path.join(args.save_dir, f"epoch_{epoch+1:03d}.pt")
+                torch.save({'state_dict': state, 'val_loss': val_loss, 'epoch': epoch}, epoch_ckpt)
+            except Exception:
+                pass
+            torch.save({
+                'state_dict': state,
+                'val_loss': val_loss,
+                'epoch': epoch,
+                'optimizer': optimizer.state_dict(),
+                'scheduler': scheduler.state_dict(),
+                'scaler': (scaler.state_dict() if hasattr(scaler, 'state_dict') else {})
+            }, last_path)
 
-        if early.step(val_loss):
-            print(f"Early stopping at epoch {epoch+1}")
+        # Early stopping with broadcast
+        stop_flag = False
+        if (not ddp_active) or (dist.get_rank() == 0):
+            if early.step(val_loss):
+                if (not ddp_active) or (dist.get_rank() == 0):
+                    print(f"Early stopping at epoch {epoch+1}")
+                stop_flag = True
+        if ddp_active:
+            try:
+                t = torch.tensor([1 if stop_flag else 0], device=device, dtype=torch.int32)
+                dist.broadcast(t, src=0)
+                stop_flag = bool(t.item() == 1)
+            except Exception:
+                pass
+        if stop_flag:
             break
 
-    best = torch.load(best_path, map_location='cpu')
+    best = torch.load(best_path, map_location='cpu') if ((not ddp_active) or (dist.get_rank() == 0)) else {'val_loss': float('inf')}
     try:
         import gc
         del model, train_loader, val_loader, optimizer, scheduler, scaler, loss_fn
@@ -1197,24 +1499,24 @@ def main():
         default='/ssd_scratch/placenta/Placenta',
         help='Root directory containing NPZ files, with train/val subdirectories.'
     )
-    parser.add_argument('--save-dir', type=str, default='saved/models', help='Directory to save checkpoints and weights (defaults here; no need to pass)')
+    parser.add_argument('--save-dir', type=str, default='/scratch/HSI_proj/weights', help='Directory to save checkpoints and weights (defaults here; no need to pass)')
     parser.add_argument('--num-classes', type=int, default=5)
-    parser.add_argument('--epochs', type=int, default=60)
+    parser.add_argument('--epochs', type=int, default=100)  # Increased from 60 for better convergence
     parser.add_argument('--batch-size', type=int, default=4)
     parser.add_argument('--num-workers', type=int, default=4)
     parser.add_argument('--seed', type=int, default=42)
-    parser.add_argument('--lr', type=float, default=2e-4)
-    parser.add_argument('--weight-decay', type=float, default=1e-4)
+    parser.add_argument('--lr', type=float, default=1e-3)  # Increased from 2e-4 for better convergence
+    parser.add_argument('--weight-decay', type=float, default=5e-5)  # Reduced from 1e-4 to prevent over-regularization
     # Loss hyperparameters
-    parser.add_argument('--lambda-u', dest='lambda_u', type=float, default=0.5, help='Weighting between focal CE and focal Dice (0..1)')
-    parser.add_argument('--alpha', type=float, default=0.25, help='Focal loss alpha')
-    parser.add_argument('--gamma', type=float, default=2.0, help='Focal loss gamma')
+    parser.add_argument('--alpha', type=float, default=0.75, help='Focal loss alpha (increased for imbalanced data)')
+    parser.add_argument('--gamma', type=float, default=3.0, help='Focal loss gamma (increased for hard examples)')
+    parser.add_argument('--lambda-u', dest='lambda_u', type=float, default=0.3, help='CE weight (reduced to favor Dice for segmentation)')
     parser.add_argument('--delta', type=float, default=0.5, help='Dice focal delta')
     parser.add_argument('--smooth', type=float, default=1e-8, help='Dice smoothing epsilon')
     parser.add_argument('--t0', type=int, default=20)
     parser.add_argument('--t-mult', type=int, default=2)
     parser.add_argument('--eta-min', type=float, default=1e-6)
-    parser.add_argument('--warmup-epochs', type=int, default=5)
+    parser.add_argument('--warmup-epochs', type=int, default=10)  # Increased from 5 for gradual warmup
     parser.add_argument('--patience', type=int, default=15)
     parser.add_argument('--min-delta', type=float, default=0.001)
     parser.add_argument('--max-grad-norm', type=float, default=1.0)
@@ -1222,7 +1524,7 @@ def main():
     parser.add_argument('--mask-key', type=str, default='mask', help='Fallback single-mask key if --mask-keys is not provided')
     parser.add_argument('--mask-keys', type=str, default='mask__artery,mask__vein,mask__suture,mask__stroma,mask__stroma_icg,mask__artery_icg,mask__umbilical_cord', help='Comma-separated mask keys for multiclass; order defines class ids 1..N (0=background)')
     parser.add_argument('--ensemble-eval', action='store_true', help='Run fold ensemble on the last fold validation set')
-    parser.add_argument('--log-dir', type=str, default='saved/models/logs', help='Directory to store logs (CSV/TensorBoard)')
+    parser.add_argument('--log-dir', type=str, default='/scratch/HSI_proj/logs', help='Directory to store logs (CSV/TensorBoard)')
     parser.add_argument('--run-name', type=str, default=None, help='Optional run name suffix for logs and checkpoints')
     parser.add_argument('--progressive-unfreeze', action='store_true', help='Enable progressive unfreezing schedule')
     # Model verbosity and sizes
@@ -1233,6 +1535,9 @@ def main():
     parser.add_argument('--very-verbose', action='store_true', help='Per-batch progress prints with filenames')
     parser.add_argument('--print-batch-files', action='store_true', help='Include file basenames in per-batch prints (implied by --very-verbose)')
     parser.add_argument('--progress-interval', type=int, default=1, help='Print every N batches when very-verbose is enabled')
+    # Workflow logs (block-level) controls
+    parser.add_argument('--workflow-logs', action='store_true', help='Show detailed per-batch block-level workflow logs (spatial local/global, fusion, tokenizer, spectral, TCME/HCMFF, decoder) on device 0')
+    parser.add_argument('--workflow-interval', type=int, default=1, help='Emit workflow logs every N batches')
     parser.add_argument('--spatial-embed-dim', type=int, default=128, help='Spatial embedding dimension')
     parser.add_argument('--spectral-embed-dim', type=int, default=128, help='Spectral embedding dimension')
     parser.add_argument('--patch-size', type=int, default=16, help='Spatial tokenizer patch size')
@@ -1245,9 +1550,21 @@ def main():
     # Performance / quality-of-life flags
     parser.add_argument('--fast-mode', action='store_true', help='Enable TF32 and cudnn.benchmark for faster training (non-deterministic)')
     parser.add_argument('--compile-model', action='store_true', help='Attempt torch.compile for performance (best effort)')
+    parser.add_argument('--channels-last', action='store_true', help='Use channels_last memory format for better CNN throughput')
+    # Gradient checkpointing and accumulation
+    parser.add_argument('--grad-checkpoint', dest='grad_checkpoint', action='store_true', help='Enable gradient checkpointing in streams (saves VRAM, more compute)')
+    parser.add_argument('--no-grad-checkpoint', dest='grad_checkpoint', action='store_false', help='Disable gradient checkpointing')
+    parser.set_defaults(grad_checkpoint=True)
+    parser.add_argument('--accum-steps', type=int, default=1, help='Gradient accumulation steps to increase effective batch size')
+    # EMA
+    parser.add_argument('--ema-decay', type=float, default=0.999, help='EMA decay for weights averaging; set 0 to disable')
+    # Distributed training flags
+    parser.add_argument('--ddp', action='store_true', help='Enable DistributedDataParallel (launch with torchrun)')
+    parser.add_argument('--dist-backend', type=str, default='nccl', help='DDP backend (default: nccl)')
     # Optional HCMFF fusion path
     parser.add_argument('--use-hcmff', action='store_true', help='Use HCMFF fusion (compresses tokens to --hcmff-tokens before fusion)')
     parser.add_argument('--hcmff-tokens', type=int, default=256, help='Number of tokens to use for HCMFF after compression (compute control)')
+    parser.add_argument('--both-fusions', action='store_true', help='Run TCME first and then refine via HCMFF (TCME -> HCMFF)')
     # Dataset convenience
     parser.add_argument('--auto-discover-mask-keys', action='store_true', help='Scan dataset to auto-discover mask_* keys and override --mask-keys')
     parser.add_argument('--merge-icg-to-base', action='store_true', help='Merge mask__stroma_icg into mask__stroma and mask__artery_icg into mask__artery (treated as the same class)')
@@ -1257,6 +1574,18 @@ def main():
     # Resume training support
     parser.add_argument('--resume', type=str, default='', help="Path to checkpoint to resume from, or 'auto' to load saved/models/last.pt if present (fallback to best.pt)")
     args = parser.parse_args()
+    # Initialize DDP if requested (torchrun provides environment vars)
+    ddp_active = False
+    if getattr(args, 'ddp', False) and (dist is not None) and torch.cuda.is_available():
+        try:
+            if not (hasattr(dist, 'is_initialized') and dist.is_initialized()):
+                dist.init_process_group(backend=args.dist_backend)
+            ddp_active = True
+            os.environ.setdefault('LOCAL_RANK', os.environ.get('LOCAL_RANK', '0'))
+            torch.cuda.set_device(int(os.environ.get('LOCAL_RANK', '0')))
+        except Exception as e:
+            print(f"[DDP] Failed to initialize process group: {e}. Proceeding without DDP.")
+            ddp_active = False
     # Apply fast-mode backend toggles
     if getattr(args, 'fast_mode', False):
         try:
@@ -1267,6 +1596,10 @@ def main():
             print("[Perf] Fast mode: TF32 enabled, cudnn.benchmark on, deterministic off")
         except Exception as e:
             print(f"[Perf] Failed to set fast-mode toggles: {e}")
+        try:
+            torch.set_float32_matmul_precision('high')
+        except Exception:
+            pass
     # Parse spectral window sizes string into list[int]
     if isinstance(args.spectral_window_sizes, str):
         try:
@@ -1292,9 +1625,17 @@ def main():
     set_seed(args.seed)
     
     # Create organized folder structure
-    # If run_name is provided, create a dedicated experiment folder
+    # If run_name is provided, create a dedicated experiment folder under the common base of save_dir/log_dir
     if args.run_name:
-        experiment_base = os.path.join(args.save_dir, args.run_name)
+        try:
+            common_base = os.path.commonpath([
+                os.path.abspath(args.save_dir),
+                os.path.abspath(args.log_dir),
+            ])
+        except Exception:
+            # Fallback to parent of save_dir
+            common_base = os.path.abspath(os.path.join(args.save_dir, os.pardir))
+        experiment_base = os.path.join(common_base, args.run_name)
         ensure_dir(experiment_base)
         # Update paths to be within the experiment folder
         args.save_dir = os.path.join(experiment_base, 'weights')
@@ -1310,14 +1651,16 @@ def main():
     if not os.path.exists(data_dir):
         raise FileNotFoundError(f"Dataset directory not found: {data_dir}.")
 
-    # Initialize logger (now logs will go to organized structure)
-    logger = CSVLogger(
-        log_dir=args.log_dir,
-        run_name=None,  # No additional subfolder since we're already organized
-        config={k: (v if isinstance(v, (int, float, str, bool, type(None))) else str(v)) for k, v in vars(args).items()}
-    )
-    print(f"Logging to: {logger.run_dir}")
-    print(f"Weights will be saved to: {args.save_dir}")
+    # Initialize logger (rank-0 only under DDP)
+    logger: Optional[CSVLogger] = None
+    if (not ddp_active) or (dist.get_rank() == 0):
+        logger = CSVLogger(
+            log_dir=args.log_dir,
+            run_name=None,  # Keep files directly under run_name/logs
+            config={k: (v if isinstance(v, (int, float, str, bool, type(None))) else str(v)) for k, v in vars(args).items()}
+        )
+        print(f"Logging to: {logger.run_dir}")
+        print(f"Weights will be saved to: {args.save_dir}")
 
     train_dir = os.path.join(data_dir, 'train')
     val_dir = os.path.join(data_dir, 'val')
@@ -1328,20 +1671,24 @@ def main():
             f"Expected 'train', 'val', and 'test' subdirectories in {data_dir}, but not all were found."
         )
 
-    print("Found train/val/test subdirectories, running a single training and testing session.")
+    if (not ddp_active) or (dist.get_rank() == 0):
+        print("Found train/val/test subdirectories, running a single training and testing session.")
     train_files = discover_npz_files(train_dir)
     val_files = discover_npz_files(val_dir)
     test_files = discover_npz_files(test_dir)
-    print(f"Discovered {len(train_files)} training, {len(val_files)} validation, and {len(test_files)} test files.")
+    if (not ddp_active) or (dist.get_rank() == 0):
+        print(f"Discovered {len(train_files)} training, {len(val_files)} validation, and {len(test_files)} test files.")
 
     # Optionally auto-discover mask keys
     if args.auto_discover_mask_keys:
         discovered = discover_mask_keys_in_npz(train_files + val_files + test_files)
         if discovered:
-            print(f"[Auto] Discovered mask keys: {discovered}")
+            if (not ddp_active) or (dist.get_rank() == 0):
+                print(f"[Auto] Discovered mask keys: {discovered}")
             args.mask_keys = discovered
         else:
-            print("[Auto] No mask_* keys discovered; keeping provided --mask-keys.")
+            if (not ddp_active) or (dist.get_rank() == 0):
+                print("[Auto] No mask_* keys discovered; keeping provided --mask-keys.")
 
     # Summarize class presence across dataset and write to run dir
     if args.mask_keys:
@@ -1358,9 +1705,10 @@ def main():
         presence_val = summarize_class_presence(val_files, args.mask_keys, merge_aliases=presence_merge_aliases)
         presence_test = summarize_class_presence(test_files, args.mask_keys, merge_aliases=presence_merge_aliases)
         # Print concise summary
-        print("Class presence (images with >0 pixels per class):")
-        for k in args.mask_keys:
-            print(f"  - {k}: total={presence_all.get(k, 0)} | train={presence_train.get(k, 0)} | val={presence_val.get(k, 0)} | test={presence_test.get(k, 0)}")
+        if (not ddp_active) or (dist.get_rank() == 0):
+            print("Class presence (images with >0 pixels per class):")
+            for k in args.mask_keys:
+                print(f"  - {k}: total={presence_all.get(k, 0)} | train={presence_train.get(k, 0)} | val={presence_val.get(k, 0)} | test={presence_test.get(k, 0)}")
         # Save CSV with per-split columns
         try:
             csv_path = os.path.join(logger.run_dir, 'class_presence.csv')
@@ -1369,21 +1717,32 @@ def main():
                 w.writerow(["mask_key", "total", "train", "val", "test"])
                 for k in args.mask_keys:
                     w.writerow([k, presence_all.get(k, 0), presence_train.get(k, 0), presence_val.get(k, 0), presence_test.get(k, 0)])
-            print(f"Saved class presence summary to {csv_path}")
+            if (not ddp_active) or (dist.get_rank() == 0):
+                print(f"Saved class presence summary to {csv_path}")
         except Exception as e:
             print(f"[WARN] Could not write class presence CSV: {e}")
 
     # Single training run
     best_path, best_loss = train_one_run(train_files, val_files, args, logger)
-    print(f"--- Training Complete ---")
-    print(f"Best Val Loss: {best_loss:.4f} | Model saved to: {best_path}")
-    print(f"-------------------------")
+    if (not ddp_active) or (dist.get_rank() == 0):
+        print(f"--- Training Complete ---")
+        print(f"Best Val Loss: {best_loss:.4f} | Model saved to: {best_path}")
+        print(f"-------------------------")
 
-    print("\nTo evaluate the best model on the test set, run the following command:")
-    print(f"python tests/evaluate.py --model-path {best_path} --data-dir {args.data_dir}")
+        print("\nTo evaluate the best model on the test set, run the following command:")
+        print(f"python tests/evaluate.py --model-path {best_path} --data-dir {args.data_dir}")
 
-    # Close logger
-    logger.close()
+        # Close logger
+        if logger is not None:
+            logger.close()
+
+    # DDP cleanup
+    if ddp_active:
+        try:
+            dist.barrier()
+            dist.destroy_process_group()
+        except Exception:
+            pass
 
 
 if __name__ == '__main__':

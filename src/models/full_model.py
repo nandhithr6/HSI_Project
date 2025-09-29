@@ -41,13 +41,15 @@ class HSIModel(nn.Module):
                  verbose: bool = False,
                  # Compatibility with training script flags (currently bypassed inside the model)
                  use_hcmff: bool = False,
-                 hcmff_tokens: int = 256):
+                 hcmff_tokens: int = 256,
+                 both_fusions: bool = False):
         super().__init__()
         self.verbose = verbose
         self.decoder_input_dim = spatial_embed_dim
         # Store flags for compatibility; current V2 pipeline does not route through HCMFF
         self.use_hcmff = use_hcmff
         self.hcmff_tokens = hcmff_tokens
+        self.both_fusions = both_fusions
 
         # --- Spatial Branch ---
         self.local_stream = LocalFeatureStream(num_bands)
@@ -81,10 +83,14 @@ class HSIModel(nn.Module):
         self.decoder_initialized = False
         self.num_classes = num_classes
         self.patch_size = patch_size
+        # Workflow logging controls (populated by training loop)
+        self.workflow_verbose = False
+        self.workflow_ctx = None
+        self.log_fn = None
         # --- Optional HCMFF path ---
         self.hcmff = None
         self.hcmff_token_proj = None  # Projects sequence length N->K for HCMFF compute control
-        if self.use_hcmff:
+        if self.use_hcmff or self.both_fusions:
             self.hcmff = HierarchicalCrossModalityFrequencyFusion(feature_dim=spatial_embed_dim, verbose=verbose)
             # Pre-initialize token projection based on expected token count
             # Each stream (spatial/spectral) produces 1024 tokens, we compress to hcmff_tokens
@@ -99,12 +105,45 @@ class HSIModel(nn.Module):
             print(f"[Init] Decoder ✓ (num_classes={num_classes}, will be initialized dynamically)")
             if self.use_hcmff:
                 print("[Init] Note: use_hcmff flag provided but HCMFF path is bypassed in this V2 model.")
+            if self.both_fusions:
+                print("[Init] Both-fusions mode: TCME -> HCMFF (final tokens from HCMFF)")
 
 
 
 
     def _should_log(self, x: torch.Tensor) -> bool:
         return self.verbose and ((x.device.type == 'cpu') or (getattr(x.device, 'index', 0) == 0))
+
+    def _should_wf_log(self, x: torch.Tensor) -> bool:
+        # Only log on CPU or cuda:0 to avoid DP spam
+        on_master = ((x.device.type == 'cpu') or (getattr(x.device, 'index', 0) == 0))
+        return bool(getattr(self, 'workflow_verbose', False) and on_master)
+
+    def _wf(self, msg: str):
+        # Enrich with context if available and route to provided logger or print
+        prefix = "[WF]"
+        ctx = getattr(self, 'workflow_ctx', None)
+        if isinstance(ctx, dict):
+            ph = ctx.get('phase', '')
+            ep = ctx.get('epoch', None)
+            ne = ctx.get('epochs', None)
+            bt = ctx.get('batch', None)
+            nb = ctx.get('batches', None)
+            parts = []
+            if ph:
+                parts.append(ph)
+            if ep is not None and ne is not None:
+                parts.append(f"ep {ep}/{ne}")
+            if bt is not None and nb is not None and nb > 0:
+                parts.append(f"batch {bt}/{nb}")
+            if parts:
+                prefix = f"[WF {' | '.join(parts)}]"
+        line = f"{prefix} {msg}"
+        fn = getattr(self, 'log_fn', None)
+        if callable(fn):
+            fn(line)
+        else:
+            print(line)
 
     def ensure_device_consistency(self, device):
         """Ensure all components are on the correct device (explicit cuda:0 for DP master)."""
@@ -194,13 +233,36 @@ class HSIModel(nn.Module):
             print(f"[FWD] Input: {tuple(x.shape)}")
 
         # --- 1. Spatial Stream -> Spatial Tokens ---
+        if self._should_wf_log(x):
+            self._wf("Spatial Local: start")
         f_local = self.local_stream(x)
+        if self._should_wf_log(x):
+            self._wf(f"Spatial Local: out {tuple(f_local.shape)}")
+
+        if self._should_wf_log(x):
+            self._wf("Spatial Global: start")
         f_global = self.global_stream(x)
+        if self._should_wf_log(x):
+            self._wf(f"Spatial Global: out {tuple(f_global.shape)}")
+
+        if self._should_wf_log(x):
+            self._wf("Spatial Fusion: start")
         f_fused_spatial = self.fusion(f_local, f_global)
+        if self._should_wf_log(x):
+            self._wf(f"Spatial Fusion: out {tuple(f_fused_spatial.shape)}")
+
+        if self._should_wf_log(x):
+            self._wf("Spatial Tokenizer: start")
         spatial_tokens = self.spatial_tokenizer(f_fused_spatial)
+        if self._should_wf_log(x):
+            self._wf(f"Spatial Tokenizer: tokens {tuple(spatial_tokens.shape)}")
         
         # --- 2. Spectral Stream -> Spectral Tokens ---
+        if self._should_wf_log(x):
+            self._wf("Spectral Stream: start")
         spectral_tokens = self.spectral_stream(x)
+        if self._should_wf_log(x):
+            self._wf(f"Spectral Stream: tokens {tuple(spectral_tokens.shape)}")
 
         if self._should_log(x):
             print("[Flow] Parallel streams computed and tokenized.")
@@ -212,8 +274,59 @@ class HSIModel(nn.Module):
             spectral_tokens = self.spec_proj(spectral_tokens)
             if self._should_log(x):
                 print(f"[Flow] Aligned spectral tokens to dim {self.decoder_input_dim}")
+            if self._should_wf_log(x):
+                self._wf(f"Align spectral tokens: proj to dim {self.decoder_input_dim}")
 
-        if self.use_hcmff and (self.hcmff is not None):
+        if self.both_fusions and (self.hcmff is not None):
+            # First TCME, then HCMFF refinement
+            if self._should_wf_log(x):
+                self._wf("TCME: start")
+            tcme_tokens = self.tcme(spatial_tokens, spectral_tokens)
+            if self._should_log(x):
+                print("[Flow] TCME fusion complete.")
+            if self._should_wf_log(x):
+                self._wf(f"TCME: fused tokens {tuple(tcme_tokens.shape)}")
+
+            # Split TCME output back into enhanced spatial and enhanced spectral halves
+            N = spatial_tokens.size(1)
+            enh_spatial = tcme_tokens[:, :N, :]
+            enh_spectral = tcme_tokens[:, N:, :]
+            if self._should_wf_log(x):
+                self._wf(f"TCME: split -> enh_spatial {tuple(enh_spatial.shape)} | enh_spectral {tuple(enh_spectral.shape)}")
+
+            # Prepare inputs for HCMFF (compress sequence length if requested)
+            target_tokens = int(self.hcmff_tokens) if getattr(self, 'hcmff_tokens', None) else None
+            def _compress_seq(tokens: torch.Tensor, K: int) -> torch.Tensor:
+                if K is None or tokens.size(1) == K:
+                    return tokens
+                if self.hcmff_token_proj is None:
+                    raise RuntimeError(f"HCMFF token projection not initialized during warmup. Expected {tokens.size(1)}→{K}")
+                N = tokens.size(1)
+                if self.hcmff_token_proj.in_features != N or self.hcmff_token_proj.out_features != K:
+                    K = self.hcmff_token_proj.out_features
+                t = tokens.transpose(1, 2)
+                t = self.hcmff_token_proj(t)
+                return t.transpose(1, 2)
+
+            if self._should_wf_log(x):
+                self._wf("HCMFF: start after TCME")
+            if target_tokens is not None:
+                spatial_for_fusion = _compress_seq(enh_spatial, target_tokens)
+                spectral_for_fusion = _compress_seq(enh_spectral, target_tokens)
+            else:
+                spatial_for_fusion = enh_spatial
+                spectral_for_fusion = enh_spectral
+            if self._should_log(x):
+                print(f"[FWD] HCMFF in Spatial -> {tuple(spatial_for_fusion.shape)} | Spectral -> {tuple(spectral_for_fusion.shape)}")
+            if self._should_wf_log(x):
+                self._wf(f"HCMFF: in spatial {tuple(spatial_for_fusion.shape)} | spectral {tuple(spectral_for_fusion.shape)}")
+            fused_tokens = self.hcmff(spatial_for_fusion, spectral_for_fusion)
+            if self._should_log(x):
+                print("[Flow] HCMFF fusion complete.")
+            if self._should_wf_log(x):
+                self._wf(f"HCMFF: fused tokens {tuple(fused_tokens.shape)}")
+        elif self.use_hcmff and (self.hcmff is not None):
+            # Optional token compression to control HCMFF compute
             # Optional token compression to control HCMFF compute
             target_tokens = int(self.hcmff_tokens) if getattr(self, 'hcmff_tokens', None) else None
             def _compress_seq(tokens: torch.Tensor, K: int) -> torch.Tensor:
@@ -236,6 +349,8 @@ class HSIModel(nn.Module):
                 t = self.hcmff_token_proj(t)
                 return t.transpose(1, 2)
 
+            if self._should_wf_log(x):
+                self._wf("HCMFF: start")
             if target_tokens is not None:
                 spatial_for_fusion = _compress_seq(spatial_tokens, target_tokens)
                 spectral_for_fusion = _compress_seq(spectral_tokens, target_tokens)
@@ -245,16 +360,26 @@ class HSIModel(nn.Module):
 
             if self._should_log(x):
                 print(f"[FWD] HCMFF in Spatial -> {tuple(spatial_for_fusion.shape)} | Spectral -> {tuple(spectral_for_fusion.shape)}")
+            if self._should_wf_log(x):
+                self._wf(f"HCMFF: in spatial {tuple(spatial_for_fusion.shape)} | spectral {tuple(spectral_for_fusion.shape)}")
             fused_tokens = self.hcmff(spatial_for_fusion, spectral_for_fusion)
             if self._should_log(x):
                 print("[Flow] HCMFF fusion complete.")
+            if self._should_wf_log(x):
+                self._wf(f"HCMFF: fused tokens {tuple(fused_tokens.shape)}")
         else:
+            if self._should_wf_log(x):
+                self._wf("TCME: start")
             fused_tokens = self.tcme(spatial_tokens, spectral_tokens)
             if self._should_log(x):
                 print("[Flow] TCME fusion complete.")
+            if self._should_wf_log(x):
+                self._wf(f"TCME: fused tokens {tuple(fused_tokens.shape)}")
         
         if self._should_log(x):
             print(f"[FWD] Fused Tokens for Decoder -> {tuple(fused_tokens.shape)}")
+        if self._should_wf_log(x):
+            self._wf(f"Decoder: start with tokens {tuple(fused_tokens.shape)}")
         
         # --- 4. Decoder ---
         if not self.decoder_initialized:
@@ -276,8 +401,14 @@ class HSIModel(nn.Module):
             self.decoder_initialized = True
             if self._should_log(x):
                 print(f"[Warmup] Initialized decoder: {num_fused_tokens} tokens, dim {token_dim}, device {device}")
+            if self._should_wf_log(x):
+                self._wf(f"Decoder: initialized tokens={num_fused_tokens} dim={token_dim}")
         
         seg_outputs = self.decoder(fused_tokens)
+        if self._should_wf_log(x):
+            if isinstance(seg_outputs, dict) and 'final_logits' in seg_outputs:
+                fl = seg_outputs['final_logits']
+                self._wf(f"Decoder: logits {tuple(fl.shape)} | upsample + seghead done")
         
         if self._should_log(x):
             print("[Flow] Decoding complete.")

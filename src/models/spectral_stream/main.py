@@ -65,6 +65,8 @@ class SpectralStream(nn.Module):
             embed_dim=embed_dim, # Output token dim is same as feature map dim
             patch_size=patch_size
         )
+        # Toggle for gradient checkpointing (set by trainer)
+        self.use_checkpointing = False
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -88,14 +90,20 @@ class SpectralStream(nn.Module):
             end = min(start + ppc, N)
             x_chunk = x_flat[start:end]
 
-            mamba_outputs = []
-            for ws in self.window_sizes:
-                windows = sliding_windows_gpu(x_chunk, window_size=ws, stride=self.stride)
-                mamba_out = self.mamba_blocks[f'mamba_ws{ws}'](windows)
-                mamba_outputs.append(mamba_out.flatten(start_dim=1))
+            def _chunk_forward(inp: torch.Tensor):
+                mamba_outputs = []
+                for ws in self.window_sizes:
+                    windows = sliding_windows_gpu(inp, window_size=ws, stride=self.stride)
+                    mamba_out = self.mamba_blocks[f'mamba_ws{ws}'](windows)
+                    mamba_outputs.append(mamba_out.flatten(start_dim=1))
+                concatenated_features = torch.cat(mamba_outputs, dim=1)
+                return self.feature_projection(concatenated_features)
 
-            concatenated_features = torch.cat(mamba_outputs, dim=1)
-            projected_chunk = self.feature_projection(concatenated_features)
+            if self.use_checkpointing and self.training:
+                from torch.utils.checkpoint import checkpoint
+                projected_chunk = checkpoint(_chunk_forward, x_chunk, use_reentrant=False)
+            else:
+                projected_chunk = _chunk_forward(x_chunk)
             pixel_features_chunks.append(projected_chunk)
 
         pixel_features = torch.cat(pixel_features_chunks, dim=0)

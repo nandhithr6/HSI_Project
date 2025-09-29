@@ -13,6 +13,10 @@ from sklearn.metrics import confusion_matrix
 from sklearn.metrics import roc_auc_score
 from tabulate import tabulate
 try:
+    import seaborn as sns
+except Exception:
+    sns = None
+try:
     from scipy.ndimage import distance_transform_edt
     from skimage.morphology import binary_erosion
 except Exception:
@@ -110,7 +114,7 @@ def main():
     parser = argparse.ArgumentParser(description="Evaluate HSI Segmentation Model")
     parser.add_argument('--model-path', type=str, required=True, help='Path to the trained model checkpoint (.pt file)')
     parser.add_argument('--data-dir', type=str, default='/ssd_scratch/placenta/Placenta', help='Root directory of the dataset')
-    parser.add_argument('--save-dir', type=str, default='saved/evaluation_results', help='Directory to save evaluation results')
+    parser.add_argument('--save-dir', type=str, default='evaluation_results', help='Directory to save evaluation results')
     parser.add_argument('--batch-size', type=int, default=1, help='Batch size for evaluation (lower if OOM)')
     parser.add_argument('--num-workers', type=int, default=4)
     parser.add_argument('--seed', type=int, default=42)
@@ -125,9 +129,21 @@ def main():
     # Metrics controls
     parser.add_argument('--compute-hd', action='store_true', help='Compute Hausdorff/HD95 metrics (can be slow)')
     parser.add_argument('--auc-max-pixels', type=int, default=200000, help='Max pixels sampled for AUC computation; set 0 to disable AUC')
+    # Performance toggles
+    parser.add_argument('--channels-last', action='store_true', help='Use channels_last memory format for inputs')
+    parser.add_argument('--fast-mode', action='store_true', help='Enable TF32 and Flash SDPA when available for faster eval')
     args = parser.parse_args()
 
     set_seed(args.seed)
+    if args.fast_mode:
+        try:
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            torch.backends.cudnn.benchmark = True
+            torch.set_float32_matmul_precision('high')
+            print("[Perf] Fast mode: TF32 + cudnn.benchmark enabled")
+        except Exception:
+            pass
     os.makedirs(args.save_dir, exist_ok=True)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
@@ -213,6 +229,17 @@ def main():
         hcmff_tokens=hcmff_tokens,
         verbose=False,
     ).to(device)
+    if args.channels_last:
+        try:
+            model = model.to(memory_format=torch.channels_last)
+            print("[Perf] channels_last enabled for model")
+        except Exception:
+            pass
+
+    # Optional multi-GPU evaluation
+    if torch.cuda.is_available() and torch.cuda.device_count() > 1 and args.batch_size >= torch.cuda.device_count():
+        model = torch.nn.DataParallel(model)
+        print(f"Using DataParallel for evaluation across {torch.cuda.device_count()} GPUs")
 
     # Warm-up first to initialize dynamic components (decoder, optional hcmff_token_proj)
     model.eval()
@@ -267,8 +294,18 @@ def main():
 
     def _forward_with_oom_fallback(images: torch.Tensor, max_splits: int = 3) -> torch.Tensor:
         try:
-            with torch.amp.autocast('cuda', enabled=torch.cuda.is_available()):
-                return model(images)['final_logits']
+            # Prefer Flash SDPA where available
+            try:
+                from torch.backends.cuda import sdp_kernel as _sdp
+                sdp_ctx = _sdp(enable_math=False, enable_flash=True, enable_mem_efficient=True)
+            except Exception:
+                class _Noop:
+                    def __enter__(self): return self
+                    def __exit__(self, *a): return False
+                sdp_ctx = _Noop()
+            with sdp_ctx:
+                with torch.amp.autocast('cuda', enabled=torch.cuda.is_available()):
+                    return model(images)['final_logits']
         except torch.cuda.OutOfMemoryError:
             if images.size(0) == 1 or max_splits <= 0:
                 raise
@@ -280,7 +317,13 @@ def main():
 
     with torch.inference_mode():
         for i, (images, targets) in enumerate(test_loader):
-            images = images.to(device)
+            if args.channels_last:
+                try:
+                    images = images.to(device, memory_format=torch.channels_last)
+                except Exception:
+                    images = images.to(device)
+            else:
+                images = images.to(device)
             targets = targets.to(device)
 
             start_time = time.time()
@@ -317,25 +360,35 @@ def main():
                         gt_c = (gt_np[bi] == c).astype(np.uint8)
                         pr_c = (pr_np[bi] == c).astype(np.uint8)
                         if gt_c.max() == 0 and pr_c.max() == 0:
+                            # Both empty - perfect match, distance = 0
+                            hd_list.append(0.0)
+                            hd95_list.append(0.0)
                             continue
                         if distance_transform_edt is None:
                             continue
                         gt_b = gt_c.astype(bool)
                         pr_b = pr_c.astype(bool)
                         if gt_b.sum() == 0 or pr_b.sum() == 0:
-                            hd = float('inf'); hd95 = float('inf')
+                            # One empty, one not - use finite large distance instead of inf
+                            hd = 100.0; hd95 = 100.0
                         else:
-                            gt_edge = gt_b ^ binary_erosion(gt_b)
-                            pr_edge = pr_b ^ binary_erosion(pr_b)
-                            dt_gt = distance_transform_edt(~gt_edge)
-                            dt_pr = distance_transform_edt(~pr_edge)
-                            d_gt_pr = dt_pr[gt_edge]
-                            d_pr_gt = dt_gt[pr_edge]
-                            if d_gt_pr.size == 0 or d_pr_gt.size == 0:
+                            try:
+                                gt_edge = gt_b ^ binary_erosion(gt_b)
+                                pr_edge = pr_b ^ binary_erosion(pr_b)
+                                if gt_edge.sum() == 0 or pr_edge.sum() == 0:
+                                    hd = float('nan'); hd95 = float('nan')
+                                else:
+                                    dt_gt = distance_transform_edt(~gt_edge)
+                                    dt_pr = distance_transform_edt(~pr_edge)
+                                    d_gt_pr = dt_pr[gt_edge]
+                                    d_pr_gt = dt_gt[pr_edge]
+                                    if d_gt_pr.size == 0 or d_pr_gt.size == 0:
+                                        hd = float('nan'); hd95 = float('nan')
+                                    else:
+                                        hd = float(max(d_gt_pr.max(), d_pr_gt.max()))
+                                        hd95 = float(max(np.percentile(d_gt_pr, 95), np.percentile(d_pr_gt, 95)))
+                            except Exception:
                                 hd = float('nan'); hd95 = float('nan')
-                            else:
-                                hd = float(max(d_gt_pr.max(), d_pr_gt.max()))
-                                hd95 = float(max(np.percentile(d_gt_pr, 95), np.percentile(d_pr_gt, 95)))
                         if not np.isnan(hd): hd_list.append(hd)
                         if not np.isnan(hd95): hd95_list.append(hd95)
 
@@ -345,6 +398,16 @@ def main():
 
     # --- Calculate and Display Metrics ---
     cm = confusion_matrix(all_targets.flatten(), all_preds.flatten(), labels=range(num_classes))
+    
+    # Debug: Check prediction diversity
+    unique_preds = np.unique(all_preds)
+    print(f"\n--- Prediction Analysis ---")
+    print(f"Unique predicted classes: {unique_preds}")
+    print(f"Model is predicting {len(unique_preds)} out of {num_classes} classes")
+    if len(unique_preds) == 1:
+        print("⚠️  WARNING: Model is only predicting a single class! This indicates severe underfitting.")
+        print("   Consider: longer training, better loss weighting, lower learning rate, or data issues.")
+    
     # Class distribution (GT and predictions)
     gt_counts = np.bincount(all_targets.flatten(), minlength=num_classes)
     pr_counts = np.bincount(all_preds.flatten(), minlength=num_classes)
@@ -356,13 +419,18 @@ def main():
         headers=["Class", "GT Pixels", "GT Ratio", "Pred Pixels", "Pred Ratio"], tablefmt="github"
     ))
     class_metrics = calculate_metrics_from_cm(cm)
-    # AUC macro
-    if auc_labels:
+    # AUC macro (handle zero predictions gracefully)
+    if auc_labels and len(np.unique(np.concatenate(auc_labels))) > 1:
         y_auc = np.concatenate(auc_labels)
         s_auc = np.concatenate(auc_scores)
         try:
-            auc_macro = float(roc_auc_score(y_auc, s_auc, multi_class='ovr', average='macro'))
-        except Exception:
+            # Only compute AUC if we have multiple classes in predictions
+            if len(np.unique(y_auc)) > 1:
+                auc_macro = float(roc_auc_score(y_auc, s_auc, multi_class='ovr', average='macro'))
+            else:
+                auc_macro = float('nan')  # Can't compute AUC with single class
+        except Exception as e:
+            print(f"[Warning] AUC calculation failed: {e}")
             auc_macro = float('nan')
     else:
         auc_macro = float('nan')
@@ -428,6 +496,29 @@ def main():
             'acc','dice_macro','iou_macro','prec_macro','rec_macro','spec_macro','balanced_accuracy','kappa','mcc','auc_macro','hd_mean','hd95_mean'
         ])
         w.writerow([acc, dice_macro, iou_macro, prec_macro, rec_macro, spec_macro, bal_acc, kappa, mcc, auc_macro, hd_mean, hd95_mean])
+
+    # --- Save Confusion Matrix (CSV + PNG) ---
+    cm_csv = os.path.join(args.save_dir, 'confusion_matrix.csv')
+    np.savetxt(cm_csv, cm.astype(int), fmt='%d', delimiter=',')
+    try:
+        plt.figure(figsize=(0.8*max(6, num_classes), 0.8*max(6, num_classes)))
+        if sns is not None:
+            sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=class_names, yticklabels=class_names)
+        else:
+            plt.imshow(cm, cmap='Blues')
+            plt.colorbar()
+            plt.xticks(ticks=range(num_classes), labels=class_names, rotation=45, ha='right')
+            plt.yticks(ticks=range(num_classes), labels=class_names)
+            for (i, j), val in np.ndenumerate(cm):
+                plt.text(j, i, f"{int(val)}", ha='center', va='center', color='black')
+        plt.xlabel('Predicted')
+        plt.ylabel('True')
+        plt.title('Confusion Matrix')
+        plt.tight_layout()
+        plt.savefig(os.path.join(args.save_dir, 'confusion_matrix.png'))
+        plt.close()
+    except Exception as e:
+        print(f"[WARN] Failed to save confusion matrix image: {e}")
 
     # --- Performance Metrics ---
     avg_inference_time = np.mean(inference_times)

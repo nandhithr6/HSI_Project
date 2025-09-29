@@ -108,6 +108,8 @@ class GlobalFeatureStream(nn.Module):
             Mamba2DBlock(embed_dim=embed_dim) for _ in range(num_layers)
         ])
         self.norm_out = nn.LayerNorm(embed_dim)
+        # Allow trainer to toggle gradient checkpointing on this module
+        self.use_checkpointing = False
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -128,8 +130,13 @@ class GlobalFeatureStream(nn.Module):
         x = x.permute(0, 2, 3, 1).contiguous()
 
         # 3. Process through Mamba layers
-        for layer in self.layers:
-            x = layer(x)
+        if self.use_checkpointing and self.training:
+            from torch.utils.checkpoint import checkpoint
+            for layer in self.layers:
+                x = checkpoint(layer, x, use_reentrant=False)
+        else:
+            for layer in self.layers:
+                x = layer(x)
 
         # 4. Final normalization and reshape back to image format
         x = self.norm_out(x)
